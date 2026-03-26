@@ -67,7 +67,7 @@ def extract_frames_from_video(video_path, output_dir, start_frame, end_frame, st
 
 parser = argparse.ArgumentParser(description="Pi3 demo with viser for 3D visualization")
 parser.add_argument(
-    "--input", type=str, default="data/examples/office", help="Path to input (folder of images or a video file)"
+    "--input", type=str, default="data/0HQv5g3aU5w", help="Path to input (folder of images or a video file)"
 )
 parser.add_argument(
     "--input2", type=str, default=None, help="Path to input (folder of images or a video file)"

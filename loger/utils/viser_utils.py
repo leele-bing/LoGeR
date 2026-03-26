@@ -20,7 +20,75 @@ except ImportError:
 
 from loger.utils.visual_util import segment_sky, download_file_from_url
 
+def add_scene_grid(server: viser.ViserServer, size_m: float = 100.0) -> None:
+    """Add a ground grid to the scene with best-effort API compatibility."""
+    half = size_m / 2.0
+    grid_attempts = [
+        {
+            "name": "/grid",
+            "width": size_m,
+            "height": size_m,
+            "width_segments": int(size_m),
+            "height_segments": int(size_m),
+            "plane": "xz",
+        },
+        {
+            "name": "/grid",
+            "width": size_m,
+            "height": size_m,
+            "cell_size": 1.0,
+            "plane": "xz",
+        },
+        {
+            "name": "/grid",
+            "width": size_m,
+            "height": size_m,
+        },
+    ]
 
+    for kwargs in grid_attempts:
+        try:
+            server.scene.add_grid(**kwargs)
+            return
+        except TypeError:
+            continue
+        except Exception as exc:
+            print(f"Warning: failed to add scene grid: {exc}")
+            return
+
+    try:
+        corners = np.array(
+            [
+                [-half, 0.0, -half],
+                [half, 0.0, -half],
+                [half, 0.0, half],
+                [-half, 0.0, half],
+            ],
+            dtype=np.float32,
+        )
+        points = np.array(
+            [
+                corners[0],
+                corners[1],
+                corners[1],
+                corners[2],
+                corners[2],
+                corners[3],
+                corners[3],
+                corners[0],
+            ],
+            dtype=np.float32,
+        )
+        server.scene.add_line_segments(
+            name="/grid_outline",
+            points=points,
+            colors=np.tile(np.array([[160, 160, 160]], dtype=np.uint8), (len(points), 1)),
+            line_width=1.5,
+        )
+    except Exception as exc:
+        print(f"Warning: failed to add fallback grid outline: {exc}")
+
+        
 def apply_ema(data: np.ndarray, alpha: float) -> np.ndarray:
     """Apply exponential moving average smoothing over time."""
     if not (0 < alpha <= 1.0):
