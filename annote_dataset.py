@@ -14,6 +14,7 @@ from loger.reconstruction import (
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reconstruct sampled image folders with Pi3X + LoGeR-style windowing.")
     parser.add_argument("--sampled_root", type=str, default="data", help="Directory containing sampled image folders.")
+    parser.add_argument("--sample_name", type=str, default=None, help="Optional single subfolder name under sampled_root to process.")
     parser.add_argument("--output_root", type=str, default="results", help="Directory to store result folders.")
     parser.add_argument("--model_name", type=str, default="ckpts/Pi3X", help="Local HF Pi3X dir or LoGeR/Pi3 checkpoint.")
     parser.add_argument("--config", type=str, default="ckpts/LoGeR_star/original_config.yaml", help="LoGeR config used to inherit window/merge defaults.")
@@ -45,7 +46,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _list_sampled_folders(sampled_root: Path) -> list[Path]:
+def _list_sampled_folders(sampled_root: Path, sample_name: str | None = None) -> list[Path]:
+    if sample_name is not None:
+        target = sampled_root / sample_name
+        if not target.is_dir():
+            raise FileNotFoundError(f"Sample folder not found: {target}")
+        if not list_image_files(target):
+            raise FileNotFoundError(f"No images found in sample folder: {target}")
+        return [target]
+
+    if sampled_root.is_dir() and list_image_files(sampled_root):
+        return [sampled_root]
+
     folders = []
     for path in sorted(sampled_root.iterdir()):
         if path.is_dir() and list_image_files(path):
@@ -60,7 +72,7 @@ def main() -> None:
 
     sampled_root = Path(args.sampled_root)
     output_root = Path(args.output_root)
-    folders = _list_sampled_folders(sampled_root)
+    folders = _list_sampled_folders(sampled_root, args.sample_name)
     if args.max_samples is not None:
         folders = folders[: args.max_samples]
     if not folders:
