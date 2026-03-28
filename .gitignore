@@ -1,7 +1,8 @@
 __pycache__/
 .vscode/
 
-results/
+results*/
 convert_ckpt_to_params.py
 *.pt
-data/
+data*/
+ckpts/

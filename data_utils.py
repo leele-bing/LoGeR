@@ -87,8 +87,31 @@ def _camera_centers_from_poses(camera_poses: torch.Tensor) -> torch.Tensor:
     return normalized[:, :3, 3]
 
 
+def _poses_in_initial_camera_frame(camera_poses: torch.Tensor) -> torch.Tensor:
+    poses = camera_poses
+    if poses.ndim == 4 and poses.shape[0] == 1:
+        poses = poses.squeeze(0)
+    if poses.ndim != 3:
+        raise ValueError(f"Expected camera_poses with shape [N, 3/4, 4/4], got {tuple(poses.shape)}")
+    normalized = torch.stack([_normalize_pose_matrix(pose) for pose in poses], dim=0)
+    first_pose_inv = torch.linalg.inv(normalized[0].to(torch.float64)).to(normalized.dtype)
+    return torch.stack([first_pose_inv @ pose for pose in normalized], dim=0)
+
+
+def _set_equal_axes_2d(ax: plt.Axes, a: np.ndarray, b: np.ndarray) -> None:
+    a_min, a_max = float(np.min(a)), float(np.max(a))
+    b_min, b_max = float(np.min(b)), float(np.max(b))
+    a_center = 0.5 * (a_min + a_max)
+    b_center = 0.5 * (b_min + b_max)
+    half_extent = max(a_max - a_min, b_max - b_min, 1e-6) * 0.5
+    ax.set_xlim(a_center - half_extent, a_center + half_extent)
+    ax.set_ylim(b_center - half_extent, b_center + half_extent)
+    ax.set_aspect("equal", adjustable="box")
+
+
 def _save_trajectory_xz_plot(output_path: Path, camera_poses: torch.Tensor) -> Path:
-    centers = _camera_centers_from_poses(camera_poses).detach().cpu().float().numpy()
+    aligned_poses = _poses_in_initial_camera_frame(camera_poses)
+    centers = _camera_centers_from_poses(aligned_poses).detach().cpu().float().numpy()
     if centers.size == 0:
         raise RuntimeError("Cannot plot trajectory without camera centers.")
 
@@ -103,9 +126,9 @@ def _save_trajectory_xz_plot(output_path: Path, camera_poses: torch.Tensor) -> P
     ax.scatter([x[-1]], [z[-1]], c=["#d62728"], s=48, label="end", zorder=3)
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
-    ax.set_title("Camera Trajectory on XZ Plane")
+    ax.set_title("Camera Trajectory on XZ Plane (Initial Camera Frame)")
     ax.grid(True, alpha=0.25)
-    ax.set_aspect("equal", adjustable="datalim")
+    _set_equal_axes_2d(ax, x, z)
     ax.legend(loc="best")
     ax.text(0.02, 0.02, f"frames: {len(centers)}", transform=ax.transAxes, fontsize=9, color="0.35", va="bottom")
     fig.tight_layout()
@@ -129,6 +152,8 @@ def _resolve_result_file(result_dir: Path, meta: Dict[str, Any], key: str, filen
     candidate = (meta.get("files") or {}).get(key)
     if candidate:
         candidate_path = Path(candidate)
+        if not candidate_path.is_absolute():
+            candidate_path = result_dir / candidate_path
         if candidate_path.exists():
             return candidate_path
     fallback = result_dir / filename
@@ -220,18 +245,14 @@ def save_result_directory(
     if alignment_payload:
         torch.save(alignment_payload, output_dir / "alignment.pt")
 
-    trajectory_plot = _save_trajectory_xz_plot(output_dir / "trajectory_xz.png", camera_poses)
+    _save_trajectory_xz_plot(output_dir / "trajectory_xz.png", camera_poses)
     meta = {
-        "frame_dir": str(frame_dir),
-        "source_video": source_video,
         "num_frames": int(camera_poses.shape[0]),
         "target_resolution": [target_width, target_height],
         "model_name": model_name,
         "model_kind": model_kind,
         "forward_kwargs": forward_kwargs,
-        "image_count": len(image_paths),
-        "files": {key: str(path) for key, path in file_map.items()},
-        "trajectory_plot": str(trajectory_plot),
+        "files": {key: path.name for key, path in file_map.items()},
         "inference_stats": inference_stats or {},
     }
     with open(output_dir / "meta.yaml", "w", encoding="utf-8") as handle:
@@ -256,20 +277,48 @@ def load_result_tensors(result_dir: str | Path) -> Dict[str, torch.Tensor]:
     }
 
 
-def load_result_for_viser(result_dir: str | Path, *, verbose: bool = True) -> Dict[str, Any]:
+def load_result_for_viser(
+    result_dir: str | Path,
+    frame_dir: str | Path,
+    *,
+    start_frame: int = 0,
+    end_frame: int = -1,
+    verbose: bool = True,
+) -> Dict[str, Any]:
     result_dir = Path(result_dir).resolve()
     meta = load_result_meta(result_dir)
-    frame_dir = Path(meta["frame_dir"])
+    frame_dir = Path(frame_dir).expanduser().resolve()
     target_resolution = tuple(meta["target_resolution"])
     image_paths = list_image_files(frame_dir)
-    images = load_images_from_paths(image_paths, target_resolution=target_resolution, verbose=verbose)
     tensors = load_result_tensors(result_dir)
+
+    sequence_length = min(
+        len(image_paths),
+        int(tensors["points"].shape[0]),
+        int(tensors["conf"].shape[0]),
+        int(tensors["camera_poses"].shape[0]),
+    )
+    if sequence_length <= 0:
+        raise RuntimeError("No frames available in the selected result directory.")
+
+    if start_frame < 0:
+        raise ValueError(f"start_frame must be >= 0, got {start_frame}")
+    start_idx = min(start_frame, sequence_length - 1)
+    end_idx = sequence_length if end_frame == -1 else min(max(start_idx + 1, end_frame), sequence_length)
+    selected_image_paths = image_paths[start_idx:end_idx]
+    if not selected_image_paths:
+        raise RuntimeError(f"No frames selected for range start_frame={start_frame}, end_frame={end_frame}")
+
+    images = load_images_from_paths(selected_image_paths, target_resolution=target_resolution, verbose=verbose)
     return {
         "images": images.permute(0, 2, 3, 1).numpy(),
-        "points": tensors["points"].float().numpy(),
-        "conf": tensors["conf"].float().numpy(),
-        "camera_poses": tensors["camera_poses"].float().numpy(),
+        "points": tensors["points"][start_idx:end_idx].float().numpy(),
+        "conf": tensors["conf"][start_idx:end_idx].float().numpy(),
+        "camera_poses": tensors["camera_poses"][start_idx:end_idx].float().numpy(),
         "frame_dir": str(frame_dir),
+        "image_paths": [str(path) for path in selected_image_paths],
+        "start_frame": start_idx,
+        "end_frame": end_idx,
         "target_resolution": list(target_resolution),
         "window_size": int((meta.get("forward_kwargs") or {}).get("window_size", 32)),
         "overlap_size": int((meta.get("forward_kwargs") or {}).get("overlap_size", 3)),

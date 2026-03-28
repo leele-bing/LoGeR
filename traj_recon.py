@@ -13,7 +13,7 @@ from loger.reconstruction import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reconstruct sampled image folders with Pi3X + LoGeR-style windowing.")
-    parser.add_argument("--sampled_root", type=str, default="data", help="Directory containing sampled image folders.")
+    parser.add_argument("--sample_root", type=str, default="data", help="Directory containing sampled image folders.")
     parser.add_argument("--sample_name", type=str, default=None, help="Optional single subfolder name under sampled_root to process.")
     parser.add_argument("--output_root", type=str, default="results", help="Directory to store result folders.")
     parser.add_argument("--model_name", type=str, default="ckpts/Pi3X", help="Local HF Pi3X dir or LoGeR/Pi3 checkpoint.")
@@ -70,7 +70,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     target_resolution = tuple(args.resolution) if args.resolution is not None else None
 
-    sampled_root = Path(args.sampled_root)
+    sampled_root = Path(args.sample_root)
     output_root = Path(args.output_root)
     folders = _list_sampled_folders(sampled_root, args.sample_name)
     if args.max_samples is not None:
@@ -141,7 +141,9 @@ def main() -> None:
             overwrite=True,
         )
         print(f"  Saved result directory to {output_dir}")
-        print(f"  Trajectory plot: {meta['trajectory_plot']}")
+        trajectory_plot_path = output_dir / "trajectory_xz.png"
+        if trajectory_plot_path.is_file():
+            print(f"  Trajectory plot: {trajectory_plot_path}")
 
 
 if __name__ == "__main__":

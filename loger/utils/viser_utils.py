@@ -118,6 +118,7 @@ def setup_camera_follow(
     frame_lag: Union[int, Callable[[], int]] = 0,
     backoff_distance: Union[float, Callable[[], float]] = 0.0,
     camera_forward: Optional[np.ndarray] = None,
+    frame_offset: int = 0,
 ) -> Tuple[Callable[[], None], Callable[[], None]]:
     """Set up camera follow behavior driven by a frame slider."""
     smoothed_target_positions = apply_ema(target_positions, target_ema_alpha)
@@ -208,7 +209,7 @@ def setup_camera_follow(
         if original_callback is None:
             @slider.on_update
             def callback(_):
-                t = int(max(0, min(slider.value, len(smoothed_target_positions) - 1)))
+                t = int(max(0, min(slider.value - frame_offset, len(smoothed_target_positions) - 1)))
                 for client in server.get_clients().values():
                     update_camera_for_target(client, t)
 
@@ -228,6 +229,7 @@ def viser_wrapper(
     video_width: int = 320,   # Video display width
     share: bool = False,
     point_size: float = 0.001,
+    show_camera_images: bool = False,
     canonical_first_frame: bool = True,  # Use first frame as canonical (identity pose)
 ):
     """Visualize predictions using Viser.
@@ -313,6 +315,11 @@ def viser_wrapper(
     if share: server.request_share_url()
     server.scene.set_up_direction("-y")
     server.scene.add_frame("/frames", show_axes=False)   # Root node
+
+    loaded_start = int(pred_dict.get("start_frame", 0))
+    loaded_end = int(pred_dict.get("end_frame", loaded_start + S))
+    loaded_end = max(loaded_start + 1, loaded_end)
+    loaded_last = loaded_end - 1
     
     H_main, W_main = xyz_data["cam0"].shape[1:3]
 
@@ -338,7 +345,7 @@ def viser_wrapper(
     # ───────────── GUI – Playback ─────────────
     with server.gui.add_folder("Playback"):
         gui_play    = server.gui.add_checkbox("Playing", True)
-        gui_frame   = server.gui.add_slider("Frame", 0, S-1, 1, 0, disabled=True)
+        gui_frame   = server.gui.add_slider("Frame", loaded_start, loaded_last, 1, loaded_start, disabled=True)
         gui_next    = server.gui.add_button("Next", disabled=True)
         gui_prev    = server.gui.add_button("Prev", disabled=True)
         gui_fps     = server.gui.add_slider("FPS", 1, 60, 0.1, 20)
@@ -362,8 +369,8 @@ def viser_wrapper(
     
     # ───────────── GUI – Frame Range & Subsample ─────────
     with server.gui.add_folder("Frame Range & Subsample"):
-        gui_start_frame = server.gui.add_slider("Start Frame", 0, S-1, 1, 0)
-        gui_end_frame = server.gui.add_slider("End Frame", 0, S-1, 1, S-1)
+        gui_start_frame = server.gui.add_slider("Start Frame", loaded_start, loaded_last, 1, loaded_start)
+        gui_end_frame = server.gui.add_slider("End Frame", loaded_start, loaded_last, 1, loaded_last)
         gui_subsample = server.gui.add_slider("Subsample", 1, 10, 1, subsample)
         gui_apply_range = server.gui.add_button("Apply Range & Subsample")
 
@@ -471,6 +478,7 @@ def viser_wrapper(
         backoff_distance=lambda: gui_camera_follow_backoff.value,
         up_direction=(0.0, -1.0, 0.0),
         fov=60.0,
+        frame_offset=loaded_start,
     )
 
     print("Building frames / point clouds …")
@@ -523,17 +531,23 @@ def viser_wrapper(
             cam_pose_4x4[:3, :] = cam_pose_3x4
             T_cam = vt.SE3.from_matrix(cam_pose_4x4)
             
-            # Use processed image for frustum view
-            frustum_img = current_img
-            if frustum_img.max() <= 1.0: frustum_img = frustum_img * 255
-            frustum_img = frustum_img.astype(np.uint8)
+            frustum_kwargs = {
+                "name": f"/frames/t{i}/frustum_{cam_id}",
+                "fov": fov_cam,
+                "aspect": aspect_cam,
+                "scale": gui_camera_size.value,
+                "wxyz": T_cam.rotation().wxyz,
+                "position": T_cam.translation(),
+                "color": col,
+                "line_width": 2.0,
+            }
+            if show_camera_images:
+                frustum_img = current_img
+                if frustum_img.max() <= 1.0:
+                    frustum_img = frustum_img * 255
+                frustum_kwargs["image"] = frustum_img.astype(np.uint8)
 
-            frustum_handle = server.scene.add_camera_frustum(
-                f"/frames/t{i}/frustum_{cam_id}", fov_cam, aspect_cam, scale=gui_camera_size.value,
-                image=frustum_img,
-                wxyz=T_cam.rotation().wxyz, position=T_cam.translation(),
-                color=col, line_width=2.0
-            )
+            frustum_handle = server.scene.add_camera_frustum(**frustum_kwargs)
             frustums[cam_id].append(frustum_handle)
 
     # ───────────── Update Visibility ─────────────
@@ -547,13 +561,14 @@ def viser_wrapper(
         end_f = gui_end_frame.value
 
         for i in range(S):
-            in_range = (start_f <= i <= end_f)
+            frame_id = loaded_start + i
+            in_range = (start_f <= frame_id <= end_f)
             if show_all_ts:
-                vis_timestep_level = (i % stride_ts == 0) and in_range
+                vis_timestep_level = (((frame_id - start_f) % stride_ts) == 0) and in_range
             elif accumulate_on_play:
-                vis_timestep_level = (start_f <= i <= current_ts) and (((i - start_f) % stride_ts) == 0) and in_range
+                vis_timestep_level = (start_f <= frame_id <= current_ts) and (((frame_id - start_f) % stride_ts) == 0) and in_range
             else:
-                vis_timestep_level = (i == current_ts) and in_range
+                vis_timestep_level = (frame_id == current_ts) and in_range
             
             if len(cam_ids) > 0 and frames_roots[cam_ids[0]][i] is not None:
                  frames_roots[cam_ids[0]][i].visible = vis_timestep_level
@@ -600,10 +615,14 @@ def viser_wrapper(
 
     # ───────────── GUI Callback Bindings ─────────────
     @gui_next.on_click
-    def _(_): gui_frame.value = (gui_frame.value+1)%S
+    def _(_):
+        next_frame = gui_frame.value + 1
+        gui_frame.value = loaded_start if next_frame > loaded_last else next_frame
 
     @gui_prev.on_click
-    def _(_): gui_frame.value = (gui_frame.value-1+S)%S
+    def _(_):
+        prev_frame = gui_frame.value - 1
+        gui_frame.value = loaded_last if prev_frame < loaded_start else prev_frame
 
     @gui_fps_btn.on_click
     def _(_): gui_fps.value = float(gui_fps_btn.value)
@@ -639,7 +658,7 @@ def viser_wrapper(
     @gui_frame.on_update
     def _(_):
         set_visibility()
-        current_frame_val = gui_frame.value
+        current_frame_val = int(max(0, min(gui_frame.value - loaded_start, S - 1)))
         for cam_id in cam_ids:
             video_previews[cam_id].image = process_video_frame(current_frame_val, cam_id)
 
@@ -665,10 +684,12 @@ def viser_wrapper(
         set_visibility()
 
     @gui_start_frame.on_update
-    def _(_): set_visibility()
+    def _(_):
+        set_visibility()
     
     @gui_end_frame.on_update
-    def _(_): set_visibility()
+    def _(_):
+        set_visibility()
     
     @gui_apply_range.on_click
     def _(_):
