@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import glob
 import math
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -164,25 +165,43 @@ def _resolve_result_file(result_dir: Path, meta: Dict[str, Any], key: str, filen
     raise FileNotFoundError(f"Could not find {key} at {fallback}")
 
 
+def _save_npz_tensor(path: Path, key: str, tensor: torch.Tensor) -> None:
+    np.savez_compressed(path, **{key: tensor.detach().cpu().numpy()})
+
+
+def _load_npz_tensor(path: Path, key: str) -> torch.Tensor:
+    with np.load(path) as payload:
+        if key not in payload:
+            raise KeyError(f"Key {key!r} not found in {path}")
+        return torch.from_numpy(payload[key])
+
+
+def _normalize_stride_value(stride: Any) -> int:
+    try:
+        return max(1, int(stride))
+    except (TypeError, ValueError):
+        return 1
+
+
 def save_result_directory(
     output_dir: str | Path,
     predictions: Dict[str, torch.Tensor],
     *,
-    frame_dir: str | Path,
-    image_paths: Sequence[str],
+    frame_dir: str | Path | None,
+    image_paths: Optional[Sequence[str]],
     model_name: str,
     model_kind: str,
     target_resolution: Optional[Tuple[int, int]],
     forward_kwargs: Dict[str, Any],
-    source_video: Optional[str] = None,
+    stride: int = 1,
+    input_frame_stride: int = 1,
+    conf_threshold: float = 0.0,
+    save_alignment: bool = False,
     inference_stats: Optional[Dict[str, Any]] = None,
     overwrite: bool = True,
 ) -> Dict[str, Any]:
     output_dir = Path(output_dir).resolve()
-    frame_dir = Path(frame_dir).resolve()
     if overwrite and output_dir.exists():
-        import shutil
-
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -192,42 +211,59 @@ def save_result_directory(
             continue
         pred[key] = value.squeeze(0) if value.ndim > 0 and value.shape[0] == 1 else value
 
-    conf = pred["conf"]
+    stride = _normalize_stride_value(stride)
+    input_frame_stride = _normalize_stride_value(input_frame_stride)
+    absolute_stride = input_frame_stride * stride
+    source_num_frames = int(pred["camera_poses"].shape[0])
+    frame_indices = torch.arange(0, source_num_frames, stride, dtype=torch.long)
+
+    conf = pred["conf"][frame_indices]
     if conf.ndim == 4 and conf.shape[-1] == 1:
         conf = conf.squeeze(-1)
-    conf = conf.to(torch.float16).contiguous()
+    conf = conf.to(torch.float32).contiguous()
+    conf_threshold = float(conf_threshold)
+    conf_threshold_normalized = conf_threshold / 100.0 if conf_threshold > 1.0 else conf_threshold
+    conf_threshold_normalized = float(np.clip(conf_threshold_normalized, 0.0, 1.0))
+    conf_mask = conf >= conf_threshold_normalized
+    conf_uint8 = torch.clamp(torch.round(conf * 255.0), 0.0, 255.0).to(torch.uint8).contiguous()
 
-    camera_poses = pred["camera_poses"].to(torch.float32).contiguous()
+    camera_poses = pred["camera_poses"][frame_indices].to(torch.float32).contiguous()
     local_points = pred.get("local_points")
-    if local_points is None:
-        raise RuntimeError("Expected local_points in predictions for depth export.")
+    if local_points is not None:
+        local_points = local_points[frame_indices]
 
     if "points" in pred:
-        points = pred["points"].to(torch.float16).contiguous()
-    else:
+        points = pred["points"][frame_indices].to(torch.float16).contiguous()
+    elif local_points is not None:
         points = torch.einsum(
             "nij, nhwj -> nhwi",
             camera_poses,
             homogenize_points(local_points.to(torch.float32)),
         )[..., :3].to(torch.float16).contiguous()
+    else:
+        raise RuntimeError("Expected either points or local_points in predictions for point export.")
 
-    depth_maps = local_points[..., 2].to(torch.float16).contiguous()
+    if "depth_maps" in pred:
+        depth_maps = pred["depth_maps"][frame_indices].to(torch.float16).contiguous()
+    elif local_points is not None:
+        depth_maps = local_points[..., 2].to(torch.float16).contiguous()
+    else:
+        raise RuntimeError("Expected either depth_maps or local_points in predictions for depth export.")
+    invalid_mask = ~conf_mask
+    points[invalid_mask.unsqueeze(-1).expand_as(points)] = torch.nan
+    depth_maps[invalid_mask] = torch.nan
     target_width, target_height = _resolve_target_resolution(target_resolution, points)
 
     file_map = {
         "points": output_dir / "points.pt",
-        "conf": output_dir / "conf.pt",
-        "camera_poses": output_dir / "camera_poses.pt",
-        "depth_maps": output_dir / "depth_maps.pt",
+        "conf": output_dir / "conf.npz",
+        "camera_poses": output_dir / "camera_poses.npz",
+        "depth_maps": output_dir / "depth_maps.npz",
     }
-    payloads = {
-        "points": points,
-        "conf": conf,
-        "camera_poses": camera_poses,
-        "depth_maps": depth_maps,
-    }
-    for key, path in file_map.items():
-        torch.save(payloads[key], path)
+    torch.save(points, file_map["points"])
+    _save_npz_tensor(file_map["conf"], "conf", conf_uint8)
+    _save_npz_tensor(file_map["camera_poses"], "camera_poses", camera_poses)
+    _save_npz_tensor(file_map["depth_maps"], "depth_maps", depth_maps)
 
     alignment_keys = [
         "chunk_sim3_scales",
@@ -242,19 +278,36 @@ def save_result_directory(
         "overlap_next_conf",
     ]
     alignment_payload = {key: pred[key] for key in alignment_keys if key in pred}
-    if alignment_payload:
+    if save_alignment and alignment_payload:
+        for key, value in list(alignment_payload.items()):
+            if not torch.is_tensor(value):
+                continue
+            if value.ndim > 0 and value.shape[0] == source_num_frames:
+                alignment_payload[key] = value[frame_indices]
+            elif value.ndim > 1 and value.shape[1] == source_num_frames:
+                alignment_payload[key] = value[:, frame_indices]
         torch.save(alignment_payload, output_dir / "alignment.pt")
 
     _save_trajectory_xz_plot(output_dir / "trajectory_xz.png", camera_poses)
+    video_name = Path(frame_dir).name if frame_dir is not None else None
     meta = {
         "num_frames": int(camera_poses.shape[0]),
+        "stride": absolute_stride,
+        "video_name": video_name,
+        "conf_threshold": conf_threshold_normalized,
+        "conf_storage": "npz_uint8_255",
+        "camera_pose_storage": "npz_float32",
+        "depth_storage": "npz_float16",
+        "save_alignment": bool(save_alignment),
         "target_resolution": [target_width, target_height],
         "model_name": model_name,
         "model_kind": model_kind,
-        "forward_kwargs": forward_kwargs,
+        "window_size": int(forward_kwargs.get("window_size", 32)),
+        "overlap_size": int(forward_kwargs.get("overlap_size", 3)),
         "files": {key: path.name for key, path in file_map.items()},
-        "inference_stats": inference_stats or {},
     }
+    if inference_stats:
+        meta["inference_stats"] = inference_stats
     with open(output_dir / "meta.yaml", "w", encoding="utf-8") as handle:
         yaml.safe_dump(meta, handle, sort_keys=False)
     return meta
@@ -269,12 +322,38 @@ def load_result_meta(result_dir: str | Path) -> Dict[str, Any]:
 def load_result_tensors(result_dir: str | Path) -> Dict[str, torch.Tensor]:
     result_dir = Path(result_dir).resolve()
     meta = load_result_meta(result_dir)
+    conf_path = _resolve_result_file(result_dir, meta, "conf", "conf.npz")
+    if conf_path.suffix == ".npz":
+        conf = _load_npz_tensor(conf_path, "conf")
+    else:
+        conf = torch.load(conf_path, map_location="cpu", weights_only=False)
+    if torch.is_tensor(conf) and conf.dtype == torch.uint8:
+        conf = conf.to(torch.float32) / 255.0
+    depth_path = _resolve_result_file(result_dir, meta, "depth_maps", "depth_maps.npz")
+    if depth_path.suffix == ".npz":
+        depth_maps = _load_npz_tensor(depth_path, "depth_maps")
+    else:
+        depth_maps = torch.load(depth_path, map_location="cpu", weights_only=False)
+    camera_pose_path = _resolve_result_file(result_dir, meta, "camera_poses", "camera_poses.npz")
+    if camera_pose_path.suffix == ".npz":
+        camera_poses = _load_npz_tensor(camera_pose_path, "camera_poses")
+    else:
+        camera_poses = torch.load(camera_pose_path, map_location="cpu", weights_only=False)
     return {
         "points": torch.load(_resolve_result_file(result_dir, meta, "points", "points.pt"), map_location="cpu", weights_only=False),
-        "conf": torch.load(_resolve_result_file(result_dir, meta, "conf", "conf.pt"), map_location="cpu", weights_only=False),
-        "camera_poses": torch.load(_resolve_result_file(result_dir, meta, "camera_poses", "camera_poses.pt"), map_location="cpu", weights_only=False),
-        "depth_maps": torch.load(_resolve_result_file(result_dir, meta, "depth_maps", "depth_maps.pt"), map_location="cpu", weights_only=False),
+        "conf": conf,
+        "camera_poses": camera_poses,
+        "depth_maps": depth_maps,
     }
+
+
+def load_alignment_payload(result_dir: str | Path) -> Dict[str, Any]:
+    result_dir = Path(result_dir).resolve()
+    alignment_path = result_dir / "alignment.pt"
+    if not alignment_path.is_file():
+        return {}
+    payload = torch.load(alignment_path, map_location="cpu", weights_only=False)
+    return payload if isinstance(payload, dict) else {}
 
 
 def load_result_for_viser(
@@ -291,9 +370,11 @@ def load_result_for_viser(
     target_resolution = tuple(meta["target_resolution"])
     image_paths = list_image_files(frame_dir)
     tensors = load_result_tensors(result_dir)
+    stored_stride = _normalize_stride_value(meta.get("stride", 1))
+    indexed_image_paths = image_paths[::stored_stride]
 
     sequence_length = min(
-        len(image_paths),
+        len(indexed_image_paths),
         int(tensors["points"].shape[0]),
         int(tensors["conf"].shape[0]),
         int(tensors["camera_poses"].shape[0]),
@@ -305,7 +386,7 @@ def load_result_for_viser(
         raise ValueError(f"start_frame must be >= 0, got {start_frame}")
     start_idx = min(start_frame, sequence_length - 1)
     end_idx = sequence_length if end_frame == -1 else min(max(start_idx + 1, end_frame), sequence_length)
-    selected_image_paths = image_paths[start_idx:end_idx]
+    selected_image_paths = indexed_image_paths[start_idx:end_idx]
     if not selected_image_paths:
         raise RuntimeError(f"No frames selected for range start_frame={start_frame}, end_frame={end_frame}")
 
@@ -320,14 +401,15 @@ def load_result_for_viser(
         "start_frame": start_idx,
         "end_frame": end_idx,
         "target_resolution": list(target_resolution),
-        "window_size": int((meta.get("forward_kwargs") or {}).get("window_size", 32)),
-        "overlap_size": int((meta.get("forward_kwargs") or {}).get("overlap_size", 3)),
+        "window_size": int(meta.get("window_size", (meta.get("forward_kwargs") or {}).get("window_size", 32))),
+        "overlap_size": int(meta.get("overlap_size", (meta.get("forward_kwargs") or {}).get("overlap_size", 3))),
     }
 
 
 __all__ = [
     "list_image_files",
     "load_images_from_paths",
+    "load_alignment_payload",
     "load_result_for_viser",
     "load_result_meta",
     "load_result_tensors",

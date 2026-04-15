@@ -13,9 +13,9 @@ from loger.reconstruction import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reconstruct sampled image folders with Pi3X + LoGeR-style windowing.")
-    parser.add_argument("--sample_root", type=str, default="data", help="Directory containing sampled image folders.")
+    parser.add_argument("--sample_root", type=str, default="/home/pcl/Dataset/YTB/img", help="Directory containing sampled image folders.")
     parser.add_argument("--sample_name", type=str, default=None, help="Optional single subfolder name under sampled_root to process.")
-    parser.add_argument("--output_root", type=str, default="results", help="Directory to store result folders.")
+    parser.add_argument("--output_root", type=str, default="/home/pcl/Dataset/YTB/traj", help="Directory to store result folders.")
     parser.add_argument("--model_name", type=str, default="ckpts/Pi3X", help="Local HF Pi3X dir or LoGeR/Pi3 checkpoint.")
     parser.add_argument("--config", type=str, default="ckpts/LoGeR_star/original_config.yaml", help="LoGeR config used to inherit window/merge defaults.")
 
@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     
     parser.add_argument("--force_annotation", action="store_true", help="Overwrite existing annotation outputs.")
     parser.add_argument("--max_samples", type=int, default=None, help="Optional limit on the number of sampled folders to process.")
+    parser.add_argument("--stride", type=int, default=3, help="Save every Nth frame result.")
+    parser.add_argument("--conf_threshold", type=float, default=30.0, help="Only keep points/depth where confidence >= this value. Accepts [0,1] or [0,100].")
     parser.add_argument(
         "--resolution",
         nargs=2,
@@ -110,7 +112,7 @@ def main() -> None:
         print(f"\n[{index}/{len(folders)}] Processing {frame_dir.name}")
         output_dir = output_root / frame_dir.name
         if output_dir.exists() and not args.force_annotation:
-            required = ["meta.yaml", "camera_poses.pt", "depth_maps.pt", "points.pt", "conf.pt", "trajectory_xz.png"]
+            required = ["meta.yaml", "camera_poses.npz", "depth_maps.npz", "points.pt", "conf.npz", "trajectory_xz.png"]
             if all((output_dir / name).exists() for name in required):
                 print(f"  Skipping annotation because output already exists: {output_dir}")
                 continue
@@ -136,7 +138,8 @@ def main() -> None:
             model_kind=model_kind,
             target_resolution=target_resolution,
             forward_kwargs=forward_kwargs,
-            source_video=None,
+            stride=args.stride,
+            conf_threshold=args.conf_threshold,
             inference_stats=stats,
             overwrite=True,
         )

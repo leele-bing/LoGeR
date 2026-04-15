@@ -12,12 +12,12 @@ import torch
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Plot trajectory from camera_poses.pt.")
+    parser = argparse.ArgumentParser(description="Plot trajectory from camera_poses data.")
     parser.add_argument(
         "--input",
         type=str,
         required=True,
-        help="Path to camera_poses.pt, or a result directory that contains camera_poses.pt.",
+        help="Path to camera_poses.pt/.npz, or a result directory that contains camera_poses data.",
     )
     parser.add_argument(
         "--output",
@@ -48,10 +48,25 @@ def resolve_camera_pose_file(input_path: str | Path) -> Path:
     if path.is_file():
         return path
     if path.is_dir():
-        pose_path = path / "camera_poses.pt"
-        if pose_path.is_file():
-            return pose_path
-    raise FileNotFoundError(f"Cannot find camera_poses.pt from input: {path}")
+        for filename in ("camera_poses.npz", "camera_poses.pt"):
+            pose_path = path / filename
+            if pose_path.is_file():
+                return pose_path
+    raise FileNotFoundError(f"Cannot find camera_poses.npz or camera_poses.pt from input: {path}")
+
+
+def load_camera_poses(pose_path: str | Path) -> torch.Tensor:
+    path = Path(pose_path).expanduser().resolve()
+    if path.suffix == ".npz":
+        with np.load(path) as payload:
+            if "camera_poses" not in payload:
+                raise KeyError(f"Key 'camera_poses' not found in {path}")
+            camera_poses = torch.from_numpy(payload["camera_poses"])
+    else:
+        camera_poses = torch.load(path, map_location="cpu", weights_only=False)
+    if not torch.is_tensor(camera_poses):
+        raise TypeError(f"Expected tensor in {path}, got {type(camera_poses)!r}")
+    return camera_poses
 
 
 def normalize_pose_matrix(pose: torch.Tensor) -> torch.Tensor:
@@ -182,9 +197,7 @@ def save_trajectory_plot_3d(output_path: Path, camera_poses: torch.Tensor, dpi: 
 def main() -> None:
     args = parse_args()
     pose_path = resolve_camera_pose_file(args.input)
-    camera_poses = torch.load(pose_path, map_location="cpu", weights_only=False)
-    if not torch.is_tensor(camera_poses):
-        raise TypeError(f"Expected tensor in {pose_path}, got {type(camera_poses)!r}")
+    camera_poses = load_camera_poses(pose_path)
 
     if args.output is None:
         if args.mode == "3d":
