@@ -20,73 +20,26 @@ except ImportError:
 
 from loger.utils.visual_util import segment_sky, download_file_from_url
 
-def add_scene_grid(server: viser.ViserServer, size_m: float = 100.0) -> None:
-    """Add a ground grid to the scene with best-effort API compatibility."""
-    half = size_m / 2.0
-    grid_attempts = [
-        {
-            "name": "/grid",
-            "width": size_m,
-            "height": size_m,
-            "width_segments": int(size_m),
-            "height_segments": int(size_m),
-            "plane": "xz",
-        },
-        {
-            "name": "/grid",
-            "width": size_m,
-            "height": size_m,
-            "cell_size": 1.0,
-            "plane": "xz",
-        },
-        {
-            "name": "/grid",
-            "width": size_m,
-            "height": size_m,
-        },
-    ]
 
-    for kwargs in grid_attempts:
-        try:
-            server.scene.add_grid(**kwargs)
-            return
-        except TypeError:
-            continue
-        except Exception as exc:
-            print(f"Warning: failed to add scene grid: {exc}")
-            return
+def add_scene_grid(server: viser.ViserServer, size_m: float = 200.0, cell_size_m: float = 2.0) -> None:
+    """Add a simple XZ-plane grid with a fixed 2 m cell size."""
+    server.scene.add_grid(
+        name="/grid",
+        width=size_m,
+        height=size_m,
+        width_segments=max(1, int(round(size_m / cell_size_m))),
+        height_segments=max(1, int(round(size_m / cell_size_m))),
+        plane="xz",
+    )
 
-    try:
-        corners = np.array(
-            [
-                [-half, 0.0, -half],
-                [half, 0.0, -half],
-                [half, 0.0, half],
-                [-half, 0.0, half],
-            ],
-            dtype=np.float32,
-        )
-        points = np.array(
-            [
-                corners[0],
-                corners[1],
-                corners[1],
-                corners[2],
-                corners[2],
-                corners[3],
-                corners[3],
-                corners[0],
-            ],
-            dtype=np.float32,
-        )
-        server.scene.add_line_segments(
-            name="/grid_outline",
-            points=points,
-            colors=np.tile(np.array([[160, 160, 160]], dtype=np.uint8), (len(points), 1)),
-            line_width=1.5,
-        )
-    except Exception as exc:
-        print(f"Warning: failed to add fallback grid outline: {exc}")
+
+def add_origin_axes(server: viser.ViserServer, axes_length: float = 1.0) -> None:
+    """Add the origin coordinate frame."""
+    server.scene.add_frame(
+        name="/origin",
+        show_axes=True,
+        axes_length=axes_length,
+    )
 
         
 def apply_ema(data: np.ndarray, alpha: float) -> np.ndarray:
@@ -314,6 +267,8 @@ def viser_wrapper(
     server = viser.ViserServer(host="0.0.0.0", port=port)
     if share: server.request_share_url()
     server.scene.set_up_direction("-y")
+    add_scene_grid(server)
+    add_origin_axes(server)
     server.scene.add_frame("/frames", show_axes=False)   # Root node
 
     loaded_start = int(pred_dict.get("start_frame", 0))

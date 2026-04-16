@@ -10,6 +10,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from data_utils import load_result_meta
+from align_ground import apply_transform_to_poses, estimate_trajectory_frame
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Plot trajectory from camera_poses data.")
@@ -40,6 +43,22 @@ def parse_args() -> argparse.Namespace:
         help="Projection plane for plotting.",
     )
     parser.add_argument("--dpi", type=int, default=160, help="Figure DPI.")
+    parser.add_argument("--use_result_frame", action="store_true", help="Use the saved result frame instead of recentering to the first frame.")
+    parser.add_argument(
+        "--reference_frame",
+        type=str,
+        default="auto",
+        choices=["auto", "initial_camera", "result", "trajectory_plane"],
+        help="Which reference frame to plot in.",
+    )
+    parser.add_argument(
+        "--plane_origin",
+        type=str,
+        default="first_camera",
+        choices=["first_camera", "centroid"],
+        help="Origin placement used when reference_frame=trajectory_plane.",
+    )
+    parser.add_argument("--frame_step", type=int, default=1, help="Use every Nth camera center when fitting the trajectory plane.")
     return parser.parse_args()
 
 
@@ -53,6 +72,13 @@ def resolve_camera_pose_file(input_path: str | Path) -> Path:
             if pose_path.is_file():
                 return pose_path
     raise FileNotFoundError(f"Cannot find camera_poses.npz or camera_poses.pt from input: {path}")
+
+
+def load_meta_from_input(input_path: str | Path) -> dict:
+    path = Path(input_path).expanduser().resolve()
+    if path.is_dir() and (path / "meta.yaml").is_file():
+        return load_result_meta(path)
+    return {}
 
 
 def load_camera_poses(pose_path: str | Path) -> torch.Tensor:
@@ -136,8 +162,16 @@ def set_equal_axes_3d(ax, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> None:
     ax.set_box_aspect((1.0, 1.0, 1.0))
 
 
-def save_trajectory_plot(output_path: Path, camera_poses: torch.Tensor, plane: str, dpi: int) -> Path:
-    centers = camera_centers_from_poses(poses_in_initial_camera_frame(camera_poses)).detach().cpu().float().numpy()
+def save_trajectory_plot(
+    output_path: Path,
+    camera_poses: torch.Tensor,
+    plane: str,
+    dpi: int,
+    *,
+    canonical_first_frame: bool = True,
+) -> Path:
+    poses = poses_in_initial_camera_frame(camera_poses) if canonical_first_frame else camera_poses
+    centers = camera_centers_from_poses(poses).detach().cpu().float().numpy()
     if centers.size == 0:
         raise RuntimeError("Cannot plot trajectory without camera centers.")
 
@@ -154,7 +188,8 @@ def save_trajectory_plot(output_path: Path, camera_poses: torch.Tensor, plane: s
     ax.scatter([a[-1]], [b[-1]], c=["#d62728"], s=48, label="end", zorder=3)
     ax.set_xlabel(label_a)
     ax.set_ylabel(label_b)
-    ax.set_title(f"Camera Trajectory on {label_a}{label_b} Plane (Initial Camera Frame)")
+    title_suffix = "Initial Camera Frame" if canonical_first_frame else "Result Frame"
+    ax.set_title(f"Camera Trajectory on {label_a}{label_b} Plane ({title_suffix})")
     ax.grid(True, alpha=0.25)
     set_equal_axes_2d(ax, a, b)
     ax.legend(loc="best")
@@ -165,8 +200,15 @@ def save_trajectory_plot(output_path: Path, camera_poses: torch.Tensor, plane: s
     return output_path
 
 
-def save_trajectory_plot_3d(output_path: Path, camera_poses: torch.Tensor, dpi: int) -> Path:
-    centers = camera_centers_from_poses(poses_in_initial_camera_frame(camera_poses)).detach().cpu().float().numpy()
+def save_trajectory_plot_3d(
+    output_path: Path,
+    camera_poses: torch.Tensor,
+    dpi: int,
+    *,
+    canonical_first_frame: bool = True,
+) -> Path:
+    poses = poses_in_initial_camera_frame(camera_poses) if canonical_first_frame else camera_poses
+    centers = camera_centers_from_poses(poses).detach().cpu().float().numpy()
     if centers.size == 0:
         raise RuntimeError("Cannot plot trajectory without camera centers.")
 
@@ -185,7 +227,8 @@ def save_trajectory_plot_3d(output_path: Path, camera_poses: torch.Tensor, dpi: 
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
-    ax.set_title("Camera Trajectory in 3D Space (Initial Camera Frame)")
+    title_suffix = "Initial Camera Frame" if canonical_first_frame else "Result Frame"
+    ax.set_title(f"Camera Trajectory in 3D Space ({title_suffix})")
     set_equal_axes_3d(ax, x, y, z)
     ax.legend(loc="best")
     fig.tight_layout()
@@ -196,8 +239,23 @@ def save_trajectory_plot_3d(output_path: Path, camera_poses: torch.Tensor, dpi: 
 
 def main() -> None:
     args = parse_args()
+    meta = load_meta_from_input(args.input)
     pose_path = resolve_camera_pose_file(args.input)
     camera_poses = load_camera_poses(pose_path)
+    if args.reference_frame != "auto":
+        reference_frame = args.reference_frame
+    elif args.use_result_frame or meta.get("reference_frame", "initial_camera") != "initial_camera":
+        reference_frame = "result"
+    else:
+        reference_frame = "initial_camera"
+    if reference_frame == "trajectory_plane":
+        alignment = estimate_trajectory_frame(
+            camera_poses,
+            frame_step=args.frame_step,
+            plane_origin=args.plane_origin,
+        )
+        camera_poses = apply_transform_to_poses(camera_poses, alignment["transform"])
+    canonical_first_frame = reference_frame == "initial_camera"
 
     if args.output is None:
         if args.mode == "3d":
@@ -208,9 +266,9 @@ def main() -> None:
         output_path = Path(args.output).expanduser().resolve()
 
     if args.mode == "3d":
-        saved = save_trajectory_plot_3d(output_path, camera_poses, dpi=args.dpi)
+        saved = save_trajectory_plot_3d(output_path, camera_poses, dpi=args.dpi, canonical_first_frame=canonical_first_frame)
     else:
-        saved = save_trajectory_plot(output_path, camera_poses, plane=args.plane, dpi=args.dpi)
+        saved = save_trajectory_plot(output_path, camera_poses, plane=args.plane, dpi=args.dpi, canonical_first_frame=canonical_first_frame)
     print(f"Loaded poses: {pose_path}")
     print(f"Saved trajectory plot: {saved}")
 
