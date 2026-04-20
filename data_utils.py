@@ -29,6 +29,18 @@ def list_image_files(input_dir: str | Path) -> List[str]:
     return [path for path in image_paths if "depth" not in Path(path).name.lower()]
 
 
+def list_image_dirs(input_root: str | Path) -> List[Path]:
+    root = Path(input_root).expanduser().resolve()
+    if not root.is_dir():
+        return []
+
+    if list_image_files(root):
+        return [root]
+
+    matches = [path for path in root.rglob("*") if path.is_dir() and list_image_files(path)]
+    return [Path(path) for path in natsorted(matches)]
+
+
 def load_images_from_paths(
     image_paths: Sequence[str],
     *,
@@ -407,6 +419,7 @@ def load_result_for_viser(
 
 
 __all__ = [
+    "list_image_dirs",
     "list_image_files",
     "load_images_from_paths",
     "load_alignment_payload",

@@ -3,7 +3,7 @@ from pathlib import Path
 
 import torch
 
-from data_utils import list_image_files, load_images_from_paths, save_result_directory
+from data_utils import list_image_dirs, list_image_files, load_images_from_paths, save_result_directory
 from loger.reconstruction import (
     build_forward_kwargs,
     load_reconstruction_model,
@@ -53,18 +53,23 @@ def _list_sampled_folders(sampled_root: Path, sample_name: str | None = None) ->
         target = sampled_root / sample_name
         if not target.is_dir():
             raise FileNotFoundError(f"Sample folder not found: {target}")
-        if not list_image_files(target):
+        folders = list_image_dirs(target)
+        if not folders:
             raise FileNotFoundError(f"No images found in sample folder: {target}")
-        return [target]
+        return folders
 
-    if sampled_root.is_dir() and list_image_files(sampled_root):
-        return [sampled_root]
+    return list_image_dirs(sampled_root)
 
-    folders = []
-    for path in sorted(sampled_root.iterdir()):
-        if path.is_dir() and list_image_files(path):
-            folders.append(path)
-    return folders
+
+def _resolve_output_dir(frame_dir: Path, sampled_root: Path, output_root: Path) -> Path:
+    try:
+        relative_path = frame_dir.relative_to(sampled_root)
+    except ValueError:
+        return output_root / frame_dir.name
+
+    if relative_path == Path("."):
+        return output_root / frame_dir.name
+    return output_root / relative_path
 
 
 def main() -> None:
@@ -109,8 +114,9 @@ def main() -> None:
         if not image_paths:
             continue
 
-        print(f"\n[{index}/{len(folders)}] Processing {frame_dir.name}")
-        output_dir = output_root / frame_dir.name
+        relative_desc = frame_dir.relative_to(sampled_root)
+        print(f"\n[{index}/{len(folders)}] Processing {relative_desc}")
+        output_dir = _resolve_output_dir(frame_dir, sampled_root, output_root)
         if output_dir.exists() and not args.force_annotation:
             required = ["meta.yaml", "camera_poses.npz", "depth_maps.npz", "points.pt", "conf.npz", "trajectory_xz.png"]
             if all((output_dir / name).exists() for name in required):
