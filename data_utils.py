@@ -122,9 +122,15 @@ def _set_equal_axes_2d(ax: plt.Axes, a: np.ndarray, b: np.ndarray) -> None:
     ax.set_aspect("equal", adjustable="box")
 
 
-def _save_trajectory_xz_plot(output_path: Path, camera_poses: torch.Tensor) -> Path:
-    aligned_poses = _poses_in_initial_camera_frame(camera_poses)
-    centers = _camera_centers_from_poses(aligned_poses).detach().cpu().float().numpy()
+def save_trajectory_xz_plot(
+    output_path: str | Path,
+    camera_poses: torch.Tensor,
+    *,
+    canonical_first_frame: bool = True,
+    title_suffix: str | None = None,
+) -> Path:
+    poses = _poses_in_initial_camera_frame(camera_poses) if canonical_first_frame else camera_poses
+    centers = _camera_centers_from_poses(poses).detach().cpu().float().numpy()
     if centers.size == 0:
         raise RuntimeError("Cannot plot trajectory without camera centers.")
 
@@ -139,7 +145,9 @@ def _save_trajectory_xz_plot(output_path: Path, camera_poses: torch.Tensor) -> P
     ax.scatter([x[-1]], [z[-1]], c=["#d62728"], s=48, label="end", zorder=3)
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
-    ax.set_title("Camera Trajectory on XZ Plane (Initial Camera Frame)")
+    if title_suffix is None:
+        title_suffix = "Initial Camera Frame" if canonical_first_frame else "Result Frame"
+    ax.set_title(f"Camera Trajectory on XZ Plane ({title_suffix})")
     ax.grid(True, alpha=0.25)
     _set_equal_axes_2d(ax, x, z)
     ax.legend(loc="best")
@@ -210,6 +218,8 @@ def save_result_directory(
     conf_threshold: float = 0.0,
     save_alignment: bool = False,
     inference_stats: Optional[Dict[str, Any]] = None,
+    canonical_first_frame_for_plot: bool = True,
+    extra_meta: Optional[Dict[str, Any]] = None,
     overwrite: bool = True,
 ) -> Dict[str, Any]:
     output_dir = Path(output_dir).resolve()
@@ -300,12 +310,17 @@ def save_result_directory(
                 alignment_payload[key] = value[:, frame_indices]
         torch.save(alignment_payload, output_dir / "alignment.pt")
 
-    _save_trajectory_xz_plot(output_dir / "trajectory_xz.png", camera_poses)
+    save_trajectory_xz_plot(
+        output_dir / "trajectory_xz.png",
+        camera_poses,
+        canonical_first_frame=canonical_first_frame_for_plot,
+    )
     video_name = Path(frame_dir).name if frame_dir is not None else None
     meta = {
         "num_frames": int(camera_poses.shape[0]),
         "stride": absolute_stride,
         "video_name": video_name,
+        "reference_frame": "initial_camera" if canonical_first_frame_for_plot else "result",
         "conf_threshold": conf_threshold_normalized,
         "conf_storage": "npz_uint8_255",
         "camera_pose_storage": "npz_float32",
@@ -320,6 +335,8 @@ def save_result_directory(
     }
     if inference_stats:
         meta["inference_stats"] = inference_stats
+    if extra_meta:
+        meta.update(extra_meta)
     with open(output_dir / "meta.yaml", "w", encoding="utf-8") as handle:
         yaml.safe_dump(meta, handle, sort_keys=False)
     return meta
@@ -408,6 +425,8 @@ def load_result_for_viser(
         "points": tensors["points"][start_idx:end_idx].float().numpy(),
         "conf": tensors["conf"][start_idx:end_idx].float().numpy(),
         "camera_poses": tensors["camera_poses"][start_idx:end_idx].float().numpy(),
+        "meta": meta,
+        "use_result_frame": meta.get("reference_frame", "initial_camera") != "initial_camera",
         "frame_dir": str(frame_dir),
         "image_paths": [str(path) for path in selected_image_paths],
         "start_frame": start_idx,
@@ -426,5 +445,6 @@ __all__ = [
     "load_result_for_viser",
     "load_result_meta",
     "load_result_tensors",
+    "save_trajectory_xz_plot",
     "save_result_directory",
 ]
