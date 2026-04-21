@@ -21,15 +21,28 @@ except ImportError:
 from loger.utils.visual_util import segment_sky, download_file_from_url
 
 
-def add_scene_grid(server: viser.ViserServer, size_m: float = 200.0, cell_size_m: float = 2.0) -> None:
-    """Add a simple XZ-plane grid with a fixed 2 m cell size."""
+def add_scene_grid(
+    server: viser.ViserServer,
+    size_m: float = 500.0,
+    section_count: int = 10,
+    y_offset_m: float = 2.0,
+) -> None:
+    """Add a sparse XZ-plane grid with 10x10 sections, lifted above the origin."""
+    server.scene.add_frame(
+        name="/grid_root",
+        show_axes=False,
+        position=(0.0, y_offset_m, 0.0),
+    )
     server.scene.add_grid(
-        name="/grid",
+        name="/grid_root/grid",
         width=size_m,
         height=size_m,
-        width_segments=max(1, int(round(size_m / cell_size_m))),
-        height_segments=max(1, int(round(size_m / cell_size_m))),
+        width_segments=max(1, int(section_count)),
+        height_segments=max(1, int(section_count)),
         plane="xz",
+        section_size = size_m*0.2,
+        cell_size = size_m*0.02,
+        fade_distance = size_m
     )
 
 
@@ -182,7 +195,6 @@ def viser_wrapper(
     video_width: int = 320,   # Video display width
     share: bool = False,
     point_size: float = 0.001,
-    show_camera_images: bool = False,
     canonical_first_frame: bool = True,  # Use first frame as canonical (identity pose)
 ):
     """Visualize predictions using Viser.
@@ -275,6 +287,9 @@ def viser_wrapper(
     loaded_end = int(pred_dict.get("end_frame", loaded_start + S))
     loaded_end = max(loaded_start + 1, loaded_end)
     loaded_last = loaded_end - 1
+    chunk_ranges = pred_dict.get("chunk_ranges") or []
+    chunk_names = pred_dict.get("chunk_names") or []
+    has_chunk_axis = bool(chunk_ranges) and len(chunk_ranges) == len(chunk_names)
     
     H_main, W_main = xyz_data["cam0"].shape[1:3]
 
@@ -309,6 +324,18 @@ def viser_wrapper(
         gui_accumulate_play = server.gui.add_checkbox("Accumulate on play", False)
         gui_stride  = server.gui.add_slider("Stride", 1, S, 1, min(10, max(0, S - 1)), disabled=True)
 
+    gui_chunk = None
+    gui_lock_chunk = None
+    chunk_sync_state = {"active": False}
+    if has_chunk_axis:
+        with server.gui.add_folder("Chunks"):
+            gui_chunk = server.gui.add_slider("Chunk", 0, len(chunk_ranges) - 1, 1, 0)
+            gui_lock_chunk = server.gui.add_checkbox("Lock Playback To Chunk", True)
+
+        print("Loaded chunk ranges:")
+        for chunk_idx, (chunk_name, (chunk_start, chunk_end)) in enumerate(zip(chunk_names, chunk_ranges)):
+            print(f"  [{chunk_idx}] {chunk_name}: global_frames=[{chunk_start}, {chunk_end})")
+
     # ───────────── GUI – Visualization ─────────
     with server.gui.add_folder("Visualization"):
         gui_show_all_cams_master = server.gui.add_checkbox("Show All Cameras", True)
@@ -338,6 +365,30 @@ def viser_wrapper(
         # We should use the percentage as a direct threshold.
         thresh = percent / 100.0
         return (conf_array >= thresh) & (conf_array > 1e-5)
+
+    def find_chunk_index_for_frame(frame_id: int) -> Optional[int]:
+        if not has_chunk_axis:
+            return None
+        for chunk_idx, (chunk_start, chunk_end) in enumerate(chunk_ranges):
+            if chunk_start <= frame_id < chunk_end:
+                return chunk_idx
+        return None
+
+    def focus_chunk(chunk_idx: int, *, update_frame: bool = True) -> None:
+        if not has_chunk_axis or gui_chunk is None or gui_lock_chunk is None:
+            return
+        chunk_idx = int(np.clip(chunk_idx, 0, len(chunk_ranges) - 1))
+        chunk_start, chunk_end = chunk_ranges[chunk_idx]
+        chunk_last = max(chunk_start, chunk_end - 1)
+        chunk_sync_state["active"] = True
+        try:
+            gui_start_frame.value = chunk_start
+            gui_end_frame.value = chunk_last
+            if update_frame or not (chunk_start <= gui_frame.value <= chunk_last):
+                gui_frame.value = chunk_start
+        finally:
+            chunk_sync_state["active"] = False
+        print(f"Selected chunk [{chunk_idx}] {chunk_names[chunk_idx]} with frame range [{chunk_start}, {chunk_end})")
 
     # ───────────── Create All Frame Nodes ─────────────
     # 不再进行中心化处理，直接使用原始坐标
@@ -496,12 +547,6 @@ def viser_wrapper(
                 "color": col,
                 "line_width": 2.0,
             }
-            if show_camera_images:
-                frustum_img = current_img
-                if frustum_img.max() <= 1.0:
-                    frustum_img = frustum_img * 255
-                frustum_kwargs["image"] = frustum_img.astype(np.uint8)
-
             frustum_handle = server.scene.add_camera_frustum(**frustum_kwargs)
             frustums[cam_id].append(frustum_handle)
 
@@ -537,6 +582,11 @@ def viser_wrapper(
                 if frustums[cam_id][i] is not None:
                     frustums[cam_id][i].visible = vis_timestep_level and individual_cam_active and master_show_frustums
     
+    if has_chunk_axis:
+        gui_play.value = False
+        gui_all.value = True
+        focus_chunk(0, update_frame=False)
+
     set_visibility()
 
     # ───────────── Refresh Point Clouds (Confidence Slider) ─────────────
@@ -616,6 +666,14 @@ def viser_wrapper(
         current_frame_val = int(max(0, min(gui_frame.value - loaded_start, S - 1)))
         for cam_id in cam_ids:
             video_previews[cam_id].image = process_video_frame(current_frame_val, cam_id)
+        if has_chunk_axis and gui_chunk is not None and not chunk_sync_state["active"]:
+            chunk_idx = find_chunk_index_for_frame(gui_frame.value)
+            if chunk_idx is not None and gui_chunk.value != chunk_idx:
+                chunk_sync_state["active"] = True
+                try:
+                    gui_chunk.value = chunk_idx
+                finally:
+                    chunk_sync_state["active"] = False
 
     @gui_all.on_update
     def _(_):
@@ -645,6 +703,18 @@ def viser_wrapper(
     @gui_end_frame.on_update
     def _(_):
         set_visibility()
+
+    if has_chunk_axis and gui_chunk is not None and gui_lock_chunk is not None:
+        @gui_chunk.on_update
+        def _(_):
+            if chunk_sync_state["active"]:
+                return
+            focus_chunk(gui_chunk.value, update_frame=gui_lock_chunk.value)
+
+        @gui_lock_chunk.on_update
+        def _(_):
+            if gui_lock_chunk.value:
+                focus_chunk(gui_chunk.value, update_frame=False)
     
     @gui_apply_range.on_click
     def _(_):

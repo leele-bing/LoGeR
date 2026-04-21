@@ -76,7 +76,7 @@ def sample_video_frames(
                 segment_frame_idx = saved_idx
             else:
                 segment_idx = saved_idx // target_frames
-                segment_dir = base_output_dir.parent / f"{base_output_dir.name}_{segment_idx:03d}"
+                segment_dir = base_output_dir / f"{base_output_dir.name}_{segment_idx:03d}"
                 segment_dir.mkdir(parents=True, exist_ok=True)
                 segment_frame_idx = saved_idx % target_frames
                 segment_dir_str = str(segment_dir)
@@ -96,7 +96,7 @@ def sample_video_frames(
 
     return {
         "video_path": str(video_path),
-        "output_dir": str(base_output_dir if target_frames is None else base_output_dir.parent),
+        "output_dir": str(base_output_dir),
         "output_dirs": output_dirs if target_frames is not None else [str(base_output_dir)],
         "frame_paths": frame_paths,
         "num_frames": saved_idx,
@@ -117,7 +117,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max_videos", type=int, default=-1, help="Number of videos to process from the sorted source list.")
     parser.add_argument("--target_fps", type=float, default=3.0, help="Sampling FPS.")
     parser.add_argument("--max_minutes", type=float, default=None, help="Maximum duration to sample from each video. Default: no duration limit.")
-    parser.add_argument("--target_frames", type=int, default=None, help="Maximum number of frames per output subfolder. When set, frames are stored in folders with _000, _001, ... suffixes.")
+    parser.add_argument(
+        "--target_frames",
+        type=int,
+        default=None,
+        help="Maximum number of frames per output subfolder. When set, frames are stored under <video>/<video>_000, <video>/<video>_001, ...",
+    )
     parser.add_argument("--jpeg_quality", type=int, default=95, help="JPEG quality for saved frames, from 0 to 100.")
     return parser.parse_args()
 
