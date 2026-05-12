@@ -25,7 +25,7 @@ def add_scene_grid(
     server: viser.ViserServer,
     size_m: float = 500.0,
     section_count: int = 10,
-    y_offset_m: float = 2.0,
+    y_offset_m: float = 0.0,
 ) -> None:
     """Add a sparse XZ-plane grid with 10x10 sections, lifted above the origin."""
     server.scene.add_frame(
@@ -210,6 +210,7 @@ def viser_wrapper(
     conf_data = {}
     cam2world_data = {}
     pcd_handles = {}
+    occupancy_handles = []
     frustums = {}
     frames_roots = {}
     video_previews = {}
@@ -220,6 +221,10 @@ def viser_wrapper(
     xyz_data_original = {}
     conf_data_original = {}
     current_subsample = [subsample]  # Use list to allow modification in nested functions
+    collision_occupancy = pred_dict.get("collision_occupancy") or {}
+    occupancy_centers = list(collision_occupancy.get("voxel_centers") or [])
+    occupancy_probabilities = list(collision_occupancy.get("voxel_probabilities") or [])
+    has_occupancy = bool(occupancy_centers) and bool(occupancy_probabilities)
 
     # Main camera (cam0)
     # Pi3 outputs images as (S,H,W,3) or (S,C,H,W) depending on processing.
@@ -348,6 +353,17 @@ def viser_wrapper(
         gui_camera_follow_ema = server.gui.add_slider("Follow EMA Alpha", 0.001, 1.0, 0.001, 0.05)
         for cam_id in cam_ids:
             gui_show_cams[cam_id] = server.gui.add_checkbox(f"Show {cam_id.upper()}", True)
+        gui_show_occupancy = None
+        gui_occupancy_point_size = None
+        if has_occupancy:
+            gui_show_occupancy = server.gui.add_checkbox("Show Occupancy", True)
+            gui_occupancy_point_size = server.gui.add_slider(
+                "Occupancy Point Size",
+                0.005,
+                0.5,
+                0.005,
+                min(0.15, max(0.02, float(collision_occupancy.get("voxel_size", 0.25)) * 0.5)),
+            )
     
     # ───────────── GUI – Frame Range & Subsample ─────────
     with server.gui.add_folder("Frame Range & Subsample"):
@@ -466,6 +482,22 @@ def viser_wrapper(
             # 直接使用原始点云坐标，不进行中心化
             xyz_centered_data[cam_id] = xyz_data[cam_id]
 
+    def occupancy_colors(probabilities: np.ndarray) -> np.ndarray:
+        probs = np.clip(np.asarray(probabilities).reshape(-1), 0.0, 1.0)
+        colors = np.zeros((len(probs), 3), dtype=np.uint8)
+        colors[:, 0] = np.clip(255 * probs, 0, 255).astype(np.uint8)
+        colors[:, 1] = np.clip(220 * (1.0 - probs), 0, 220).astype(np.uint8)
+        colors[:, 2] = 35
+        return colors
+
+    occupancy_centers_vis = []
+    if has_occupancy:
+        for i in range(S):
+            points_i = np.asarray(occupancy_centers[i], dtype=np.float32) if i < len(occupancy_centers) else np.zeros((0, 3), dtype=np.float32)
+            if canonical_first_frame and T0_inv is not None and points_i.size > 0:
+                points_i = (T0_inv[:3, :3] @ points_i.reshape(-1, 3).T).T + T0_inv[:3, 3]
+            occupancy_centers_vis.append(points_i.astype(np.float32, copy=False))
+
     # Camera follow uses cam0 camera trajectory over the frame slider.
     cam0_poses = cam2world_data["cam0"]  # (S, 3, 4)
     cam0_positions = cam0_poses[:, :3, 3]
@@ -550,6 +582,18 @@ def viser_wrapper(
             frustum_handle = server.scene.add_camera_frustum(**frustum_kwargs)
             frustums[cam_id].append(frustum_handle)
 
+        if has_occupancy:
+            occ_points = occupancy_centers_vis[i]
+            occ_probs = np.asarray(occupancy_probabilities[i], dtype=np.float32) if i < len(occupancy_probabilities) else np.zeros((0,), dtype=np.float32)
+            occ_handle = server.scene.add_point_cloud(
+                f"/frames/t{i}/occupancy",
+                occ_points,
+                occupancy_colors(occ_probs),
+                point_size=gui_occupancy_point_size.value if gui_occupancy_point_size is not None else 0.05,
+                point_shape="rounded",
+            )
+            occupancy_handles.append(occ_handle)
+
     # ───────────── Update Visibility ─────────────
     def set_visibility():
         show_all_ts = gui_all.value
@@ -581,7 +625,12 @@ def viser_wrapper(
                 
                 if frustums[cam_id][i] is not None:
                     frustums[cam_id][i].visible = vis_timestep_level and individual_cam_active and master_show_frustums
-    
+
+            if has_occupancy and i < len(occupancy_handles):
+                show_occ = True if gui_show_occupancy is None else bool(gui_show_occupancy.value)
+                occupancy_handles[i].visible = vis_timestep_level and show_occ
+
+
     if has_chunk_axis:
         gui_play.value = False
         gui_all.value = True
@@ -659,6 +708,18 @@ def viser_wrapper(
             for handle in frustums[cam_id]:
                 if handle is not None:
                     handle.scale = new_camera_size
+
+    if has_occupancy and gui_occupancy_point_size is not None:
+        @gui_occupancy_point_size.on_update
+        def _(_):
+            for handle in occupancy_handles:
+                if handle is not None:
+                    handle.point_size = gui_occupancy_point_size.value
+
+    if has_occupancy and gui_show_occupancy is not None:
+        @gui_show_occupancy.on_update
+        def _(_):
+            set_visibility()
 
     @gui_frame.on_update
     def _(_):

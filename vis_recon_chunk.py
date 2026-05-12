@@ -81,7 +81,7 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "initial_camera", "result", "trajectory_plane"],
         help="Which reference frame to visualize in.",
     )
-    parser.add_argument("--frame_step", type=int, default=1, help="Use every Nth camera center when fitting the trajectory plane.")
+    parser.add_argument("--frame_step", type=int, default=10, help="Use the first N frames to estimate up, and the displacement from frame 0 to frame N to define forward in the trajectory-aligned frame.")
     return parser.parse_args()
 
 

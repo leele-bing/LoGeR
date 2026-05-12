@@ -56,9 +56,9 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="first_camera",
         choices=["first_camera", "centroid"],
-        help="Origin placement used when reference_frame=trajectory_plane.",
+        help="Origin placement used when reference_frame=trajectory_plane in the trajectory-aligned frame.",
     )
-    parser.add_argument("--frame_step", type=int, default=1, help="Use every Nth camera center when fitting the trajectory plane.")
+    parser.add_argument("--frame_step", type=int, default=1, help="Use the first N frames to estimate up, and the displacement from frame 0 to frame N to define forward in the trajectory-aligned frame.")
     return parser.parse_args()
 
 

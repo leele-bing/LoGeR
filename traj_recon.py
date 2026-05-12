@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--window_size", type=int, default=32, help="Window size for chunked inference.")
     parser.add_argument("--overlap_size", type=int, default=3, help="Overlap size between windows.")
+    parser.add_argument("--window_batch_size", type=int, default=4, help="Number of windows to run in one Pi3X forward pass.")
     parser.add_argument("--reset_every", type=int, default=None, help="Reset interval used by LoGeR merge semantics.")
     parser.add_argument("--sim3", action="store_true", help="Use Sim3 alignment when merging windows.")
     parser.add_argument("--se3", action="store_true", default=None, help="Use SE3 alignment when merging windows.")
@@ -100,6 +101,7 @@ def main() -> None:
         config_path=args.config,
         window_size=args.window_size,
         overlap_size=args.overlap_size,
+        window_batch_size=args.window_batch_size,
         reset_every=args.reset_every,
         sim3=args.sim3,
         se3=args.se3,

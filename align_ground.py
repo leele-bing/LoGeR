@@ -16,7 +16,7 @@ from data_utils import (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Estimate a trajectory plane from camera poses and save a rotated result in that global frame."
+        description="Estimate a stable trajectory-aligned global frame from camera poses and save a rotated result in that frame."
     )
     parser.add_argument("--result_dir", type=str, required=True, help="Input reconstruction result directory.")
     parser.add_argument("--frame_dir", type=str, required=True, help="RGB frame directory corresponding to the result.")
@@ -31,13 +31,20 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="first_camera",
         choices=["first_camera", "centroid"],
-        help="How to place the world origin on the fitted motion plane.",
+        help="How to place the world origin in the estimated trajectory-aligned frame.",
     )
     parser.add_argument(
         "--frame_step",
         type=int,
         default=1,
-        help="Use every Nth camera center when fitting the trajectory plane.",
+        help="Use the first N frames to estimate the up axis, and use the displacement from frame 0 to frame N to estimate the forward axis.",
+    )
+    parser.add_argument(
+        "--camera_y_axis",
+        type=str,
+        default="down",
+        choices=["down", "up"],
+        help="Interpret the camera local y-axis as pointing down or up when estimating the global up direction.",
     )
     parser.add_argument("--force", action="store_true", help="Overwrite an existing output directory.")
     return parser.parse_args()
@@ -60,47 +67,69 @@ def camera_centers_from_poses(camera_poses: torch.Tensor | np.ndarray) -> np.nda
     return poses[:, :3, 3]
 
 
-def _fit_plane_to_camera_centers(camera_centers: np.ndarray, frame_step: int) -> tuple[np.ndarray, np.ndarray]:
-    sampled = camera_centers[:: max(1, int(frame_step))]
-    if len(sampled) < 3:
-        sampled = camera_centers
-    if len(sampled) < 3:
-        raise RuntimeError("Need at least three camera poses to estimate a trajectory plane.")
-
-    plane_point = sampled.mean(axis=0)
-    centered = sampled - plane_point
-    _, _, vh = np.linalg.svd(centered, full_matrices=False)
-    plane_normal = _normalize(vh[-1])
-    return plane_point, plane_normal
-
-
-def _estimate_up_axis(camera_centers: np.ndarray, plane_point: np.ndarray, plane_normal: np.ndarray) -> np.ndarray:
-    signed_distances = (camera_centers - plane_point) @ plane_normal
-    up_axis = plane_normal if float(np.median(signed_distances)) >= 0.0 else -plane_normal
-    up_axis = _normalize(up_axis)
-    if up_axis[1] < 0.0:
-        up_axis = -up_axis
-    return up_axis
-
-
-def _estimate_forward_axis(camera_centers: np.ndarray, up_axis: np.ndarray) -> np.ndarray:
-    displacements = np.diff(camera_centers, axis=0)
-    displacements = displacements - np.outer(displacements @ up_axis, up_axis)
-    valid = np.linalg.norm(displacements, axis=1) > 1e-6
-    if np.any(valid):
-        forward_axis = displacements[valid].sum(axis=0)
+def _camera_rotations_from_poses(camera_poses: torch.Tensor | np.ndarray) -> np.ndarray:
+    if torch.is_tensor(camera_poses):
+        poses = camera_poses.detach().cpu().float().numpy()
     else:
-        forward_axis = camera_centers[-1] - camera_centers[0]
-        forward_axis = forward_axis - np.dot(forward_axis, up_axis) * up_axis
-    if np.linalg.norm(forward_axis) < 1e-8:
-        raise RuntimeError("Could not estimate a forward direction from the trajectory.")
-    forward_axis = _normalize(forward_axis)
+        poses = np.asarray(camera_poses, dtype=np.float64)
+    if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+        raise ValueError(f"Expected camera_poses with shape [N, 4, 4], got {tuple(poses.shape)}")
+    return poses[:, :3, :3]
 
-    global_direction = camera_centers[-1] - camera_centers[0]
-    global_direction = global_direction - np.dot(global_direction, up_axis) * up_axis
-    if np.linalg.norm(global_direction) > 1e-8 and np.dot(forward_axis, global_direction) < 0:
-        forward_axis = -forward_axis
-    return forward_axis
+
+def _estimate_up_axis_from_initial_rotations(
+    camera_poses: torch.Tensor | np.ndarray,
+    *,
+    frame_step: int,
+    camera_y_axis: str,
+    max_outlier_angle_deg: float = 35.0,
+) -> np.ndarray:
+    rotations = _camera_rotations_from_poses(camera_poses)
+    if len(rotations) == 0:
+        raise RuntimeError("Need at least one camera pose to estimate the global up axis.")
+
+    frame_count = max(1, min(int(frame_step), len(rotations)))
+    local_up_sign = -1.0 if camera_y_axis == "down" else 1.0
+    up_vectors = local_up_sign * rotations[:frame_count, :, 1]
+    up_vectors = np.stack([_normalize(vector) for vector in up_vectors], axis=0)
+
+    reference = up_vectors[0]
+    aligned = up_vectors.copy()
+    flip_mask = (aligned @ reference) < 0.0
+    aligned[flip_mask] *= -1.0
+
+    mean_up = _normalize(aligned.mean(axis=0))
+    cos_threshold = float(np.cos(np.deg2rad(max_outlier_angle_deg)))
+    keep_mask = (aligned @ mean_up) >= cos_threshold
+    if np.any(keep_mask):
+        mean_up = _normalize(aligned[keep_mask].mean(axis=0))
+
+    if mean_up[1] < 0.0:
+        mean_up = -mean_up
+    return mean_up
+
+
+def _estimate_forward_axis_from_initial_displacement(
+    camera_poses: torch.Tensor | np.ndarray,
+    up_axis: np.ndarray,
+    *,
+    frame_step: int,
+) -> np.ndarray:
+    camera_centers = camera_centers_from_poses(camera_poses)
+    if len(camera_centers) < 2:
+        raise RuntimeError("Need at least one camera pose to estimate a forward direction.")
+    step = max(1, int(frame_step))
+    candidate_indices = [min(step, len(camera_centers) - 1)] + list(range(step + 1, len(camera_centers)))
+    tried = set()
+    for idx in candidate_indices:
+        if idx <= 0 or idx in tried:
+            continue
+        tried.add(idx)
+        forward_axis = camera_centers[idx] - camera_centers[0]
+        forward_axis = forward_axis - np.dot(forward_axis, up_axis) * up_axis
+        if np.linalg.norm(forward_axis) >= 1e-8:
+            return _normalize(forward_axis)
+    raise RuntimeError("The initial translation is too small or nearly parallel to the estimated up axis, so a stable forward direction could not be defined.")
 
 
 def estimate_trajectory_frame(
@@ -108,19 +137,31 @@ def estimate_trajectory_frame(
     *,
     frame_step: int = 1,
     plane_origin: str = "first_camera",
+    camera_y_axis: str = "down",
 ) -> dict[str, np.ndarray]:
     camera_centers = camera_centers_from_poses(camera_poses)
-    plane_point, plane_normal = _fit_plane_to_camera_centers(camera_centers, frame_step=frame_step)
-    up_axis = _estimate_up_axis(camera_centers, plane_point, plane_normal)
-    forward_axis = _estimate_forward_axis(camera_centers, up_axis)
+    sampled_centers = camera_centers[:: max(1, int(frame_step))]
+    if len(sampled_centers) < 2:
+        sampled_centers = camera_centers
+
+    up_axis = _estimate_up_axis_from_initial_rotations(
+        camera_poses,
+        frame_step=frame_step,
+        camera_y_axis=camera_y_axis,
+    )
+    forward_axis = _estimate_forward_axis_from_initial_displacement(
+        camera_poses,
+        up_axis,
+        frame_step=frame_step,
+    )
     right_axis = _normalize(np.cross(up_axis, forward_axis))
     forward_axis = _normalize(np.cross(right_axis, up_axis))
+    trajectory_centroid = sampled_centers.mean(axis=0)
 
     if plane_origin == "centroid":
-        origin = plane_point
+        origin = trajectory_centroid
     elif plane_origin == "first_camera":
-        first_camera = camera_centers[0]
-        origin = first_camera - np.dot(first_camera - plane_point, up_axis) * up_axis
+        origin = camera_centers[0]
     else:
         raise ValueError(f"Unsupported plane_origin: {plane_origin}")
 
@@ -131,17 +172,19 @@ def estimate_trajectory_frame(
     transform[:3, :3] = rotation
     transform[:3, 3] = translation
 
-    signed_distances = (camera_centers - plane_point) @ up_axis
+    signed_distances = (camera_centers - origin) @ up_axis
     return {
         "transform": transform,
         "rotation": rotation,
         "translation": translation,
-        "plane_point": plane_point,
+        "plane_point": trajectory_centroid,
         "plane_normal": up_axis,
         "up_axis": up_axis,
         "forward_axis": forward_axis,
         "right_axis": right_axis,
         "origin": origin,
+        "frame_step_used": np.array([min(max(1, int(frame_step)), len(camera_centers))], dtype=np.int64),
+        "camera_y_axis_sign": np.array([-1.0 if camera_y_axis == "down" else 1.0], dtype=np.float64),
         "camera_height_median": np.array([float(np.median(signed_distances))], dtype=np.float64),
         "camera_height_std": np.array([float(np.std(signed_distances))], dtype=np.float64),
     }
@@ -204,6 +247,7 @@ def main() -> None:
         tensors["camera_poses"],
         frame_step=args.frame_step,
         plane_origin=args.plane_origin,
+        camera_y_axis=args.camera_y_axis,
     )
     transform = torch.from_numpy(alignment["transform"]).to(dtype=torch.float32)
 
@@ -242,6 +286,8 @@ def main() -> None:
                 "forward_axis": alignment["forward_axis"].tolist(),
                 "right_axis": alignment["right_axis"].tolist(),
                 "origin": alignment["origin"].tolist(),
+                "frame_step_used": int(alignment["frame_step_used"][0]),
+                "camera_y_axis": args.camera_y_axis,
                 "camera_height_median": float(alignment["camera_height_median"][0]),
                 "camera_height_std": float(alignment["camera_height_std"][0]),
                 "plane_origin_mode": args.plane_origin,
@@ -256,7 +302,9 @@ def main() -> None:
     print(f"Output result: {output_dir}")
     print(f"Estimated up axis: {alignment['up_axis']}")
     print(f"Estimated forward axis: {alignment['forward_axis']}")
-    print(f"Median camera height above plane: {float(alignment['camera_height_median'][0]):.4f}")
+    print(f"Origin mode: {args.plane_origin}")
+    print(f"Frame step used for up/forward estimation: {int(alignment['frame_step_used'][0])}")
+    print(f"Median camera height above reference horizontal plane: {float(alignment['camera_height_median'][0]):.4f}")
     print(f"Saved alignment file: {alignment_path}")
     print(f"Saved aligned meta: {result_meta}")
 

@@ -100,6 +100,18 @@ def load_reconstruction_model(
 ) -> Tuple[torch.nn.Module, str]:
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+        except Exception:
+            pass
+        if hasattr(torch, "set_float32_matmul_precision"):
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
 
     if pi3x and _is_local_pi3x_dir(model_name):
         model = Pi3X.from_pretrained(model_name, use_multimodal=use_multimodal)
@@ -147,6 +159,32 @@ def _to_cpu_predictions(raw_outputs: Dict[str, Any]) -> Dict[str, torch.Tensor]:
     return predictions
 
 
+def _to_cpu_prediction_list(raw_outputs: Dict[str, Any]) -> List[Dict[str, torch.Tensor]]:
+    cpu_outputs: Dict[str, torch.Tensor] = {}
+    batch_size: Optional[int] = None
+    keep_keys = {"local_points", "conf", "camera_poses", "metric"}
+
+    for key, value in raw_outputs.items():
+        if key in keep_keys and torch.is_tensor(value):
+            tensor = value.detach().cpu()
+            if key in {"local_points", "conf", "metric"}:
+                tensor = tensor.to(torch.float16)
+            else:
+                tensor = tensor.to(torch.float32)
+            cpu_outputs[key] = tensor
+            if batch_size is None:
+                batch_size = int(tensor.shape[0])
+
+    if batch_size is None:
+        return []
+
+    predictions = [dict() for _ in range(batch_size)]
+    for key, tensor in cpu_outputs.items():
+        for idx in range(batch_size):
+            predictions[idx][key] = tensor[idx : idx + 1].contiguous()
+    return predictions
+
+
 def run_native_pi3x_windowed_inference(
     model: torch.nn.Module,
     images_tensor: torch.Tensor,
@@ -154,6 +192,7 @@ def run_native_pi3x_windowed_inference(
     device: torch.device,
     window_size: int,
     overlap_size: int,
+    window_batch_size: int,
     sim3: bool,
     se3: bool,
     reset_every: int,
@@ -164,22 +203,43 @@ def run_native_pi3x_windowed_inference(
     windows, eff_window_size, eff_overlap = compute_windows(num_frames, window_size, overlap_size)
     dtype = _get_autocast_dtype(device)
     all_predictions: List[Dict[str, torch.Tensor]] = []
+    batch_size = max(1, int(window_batch_size))
 
     if show_progress:
-        print(f"Running native Pi3X windowed inference with {len(windows)} window(s).")
+        print(
+            f"Running native Pi3X windowed inference with {len(windows)} window(s) "
+            f"and window_batch_size={batch_size}."
+        )
 
     start_time = time.time()
-    for window_idx, (start_idx, end_idx) in enumerate(windows, start=1):
+    batched_windows: List[List[Tuple[int, int]]] = []
+    current_batch: List[Tuple[int, int]] = []
+    current_length: Optional[int] = None
+    for window in windows:
+        window_length = window[1] - window[0]
+        if current_batch and (window_length != current_length or len(current_batch) >= batch_size):
+            batched_windows.append(current_batch)
+            current_batch = []
+            current_length = None
+        current_batch.append(window)
+        current_length = window_length
+    if current_batch:
+        batched_windows.append(current_batch)
+
+    for batch_idx, window_group in enumerate(batched_windows, start=1):
         if show_progress:
-            print(f"  Window {window_idx}/{len(windows)}: frames [{start_idx}, {end_idx})")
-        window_tensor = images_tensor[start_idx:end_idx].to(device, non_blocking=True)
+            start_idx, _ = window_group[0]
+            _, end_idx = window_group[-1]
+            print(
+                f"  Window batch {batch_idx}/{len(batched_windows)}: "
+                f"{len(window_group)} window(s) covering frames [{start_idx}, {end_idx})"
+            )
+        window_tensor = torch.stack([images_tensor[start:end] for start, end in window_group], dim=0).to(device, non_blocking=True)
         with torch.no_grad(), torch.amp.autocast(device_type="cuda", enabled=device.type == "cuda", dtype=dtype):
-            raw_outputs = model(window_tensor.unsqueeze(0))
+            raw_outputs = model(window_tensor)
         raw_outputs["conf"] = torch.sigmoid(raw_outputs["conf"])
-        all_predictions.append(_to_cpu_predictions(raw_outputs))
+        all_predictions.extend(_to_cpu_prediction_list(raw_outputs))
         del raw_outputs, window_tensor
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
 
     align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
     if sim3:
@@ -205,6 +265,7 @@ def run_native_pi3x_windowed_inference(
     stats = {
         "num_frames": num_frames,
         "num_windows": len(windows),
+        "window_batch_size": batch_size,
         "effective_window_size": eff_window_size,
         "effective_overlap_size": eff_overlap,
         "inference_seconds": round(time.time() - start_time, 3),
@@ -234,6 +295,7 @@ def run_inference(
             device=device,
             window_size=int(forward_kwargs.get("window_size", 32)),
             overlap_size=int(forward_kwargs.get("overlap_size", 3)),
+            window_batch_size=int(forward_kwargs.get("window_batch_size", 1)),
             sim3=bool(forward_kwargs.get("sim3", False)),
             se3=bool(forward_kwargs.get("se3", False)),
             reset_every=int(forward_kwargs.get("reset_every", 0) or 0),
@@ -262,6 +324,7 @@ def build_forward_kwargs(
     config_path: Optional[str],
     window_size: Optional[int],
     overlap_size: Optional[int],
+    window_batch_size: Optional[int],
     reset_every: Optional[int],
     sim3: bool,
     se3: Optional[bool],
@@ -285,6 +348,8 @@ def build_forward_kwargs(
         kwargs["window_size"] = window_size
     if overlap_size is not None:
         kwargs["overlap_size"] = overlap_size
+    if window_batch_size is not None:
+        kwargs["window_batch_size"] = window_batch_size
     if reset_every is not None:
         kwargs["reset_every"] = reset_every
     if sim3:

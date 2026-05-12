@@ -39,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpus", type=str, default="0", help="Comma-separated GPU ids, e.g. 0,1,2,3")
     parser.add_argument("--workers_per_gpu", type=int, default=1, help="Concurrent reconstruction workers per GPU.")
     parser.add_argument("--cpu_threads", type=int, default=4, help="OMP/MKL/OpenBLAS threads per worker process.")
+    parser.add_argument("--decode_workers", type=int, default=None, help="Threads used to decode images inside each worker.")
     parser.add_argument("--max_tasks", type=int, default=None, help="Optional limit on the number of leaf frame folders.")
     parser.add_argument("--log_dir", type=str, default=None, help="Optional directory for one log file per task.")
     parser.add_argument("--dry_run", action="store_true", help="Print planned tasks without launching reconstruction.")
@@ -47,6 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--config", type=str, default="ckpts/LoGeR_star/original_config.yaml", help="LoGeR config path.")
     parser.add_argument("--window_size", type=int, default=32, help="Window size for chunked inference.")
     parser.add_argument("--overlap_size", type=int, default=3, help="Overlap size between windows.")
+    parser.add_argument("--window_batch_size", type=int, default=4, help="Number of windows to run in one Pi3X forward pass.")
     parser.add_argument("--reset_every", type=int, default=None, help="Reset interval for merge semantics.")
     parser.add_argument("--stride", type=int, default=3, help="Save every Nth frame result.")
     parser.add_argument("--conf_threshold", type=float, default=30.0, help="Confidence threshold for exported results.")
@@ -148,6 +150,8 @@ def process_task(
         image_paths,
         target_resolution=target_resolution,
         verbose=False,
+        device=device,
+        decode_workers=args.decode_workers,
     )
     predictions, stats = run_inference(
         model,
@@ -183,12 +187,13 @@ def worker_main(
 
     import torch
 
-    from data_utils import list_image_files, load_images_from_paths, save_result_directory
+    from data_utils import save_result_directory
     from loger.reconstruction import (
         build_forward_kwargs,
         load_reconstruction_model,
         run_inference,
     )
+    from tensor_utils import list_image_files, load_images_from_paths
 
     try:
         torch.set_num_threads(args.cpu_threads)
@@ -214,6 +219,7 @@ def worker_main(
             config_path=args.config,
             window_size=args.window_size,
             overlap_size=args.overlap_size,
+            window_batch_size=args.window_batch_size,
             reset_every=args.reset_every,
             sim3=args.sim3,
             se3=args.se3,
@@ -221,6 +227,7 @@ def worker_main(
             no_ttt=args.no_ttt,
             no_swa=args.no_swa,
         )
+        forward_kwargs["window_batch_size"] = args.window_batch_size
         print(f"[{worker_name}] model ready kind={model_kind} forward_kwargs={forward_kwargs}")
     except Exception:
         result_queue.put(("worker_fail", worker_name, traceback.format_exc(), 0.0))
@@ -273,8 +280,7 @@ def worker_main(
             print(error_text)
             result_queue.put(("fail", task.relative_name, error_text, elapsed))
         finally:
-            if "torch" in locals() and device.type == "cuda":
-                torch.cuda.empty_cache()
+            pass
 
 
 def main() -> None:

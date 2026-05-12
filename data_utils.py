@@ -203,6 +203,22 @@ def _normalize_stride_value(stride: Any) -> int:
         return 1
 
 
+def _select_sequence_frames(tensor: torch.Tensor | None, frame_indices: torch.Tensor) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    if tensor.ndim == 0:
+        return tensor
+    sequence_len = int(tensor.shape[0])
+    num_selected = int(frame_indices.numel())
+    if sequence_len == num_selected:
+        return tensor
+    if sequence_len < int(frame_indices[-1].item()) + 1:
+        raise RuntimeError(
+            f"Tensor sequence length {sequence_len} is shorter than required frame index {int(frame_indices[-1].item())}."
+        )
+    return tensor[frame_indices]
+
+
 def save_result_directory(
     output_dir: str | Path,
     predictions: Dict[str, torch.Tensor],
@@ -237,43 +253,50 @@ def save_result_directory(
     input_frame_stride = _normalize_stride_value(input_frame_stride)
     absolute_stride = input_frame_stride * stride
     source_num_frames = int(pred["camera_poses"].shape[0])
-    frame_indices = torch.arange(0, source_num_frames, stride, dtype=torch.long)
+    point_frame_indices = torch.arange(0, source_num_frames, absolute_stride, dtype=torch.long)
 
-    conf = pred["conf"][frame_indices]
-    if conf.ndim == 4 and conf.shape[-1] == 1:
-        conf = conf.squeeze(-1)
-    conf = conf.to(torch.float32).contiguous()
+    conf_raw = pred["conf"]
+    if conf_raw.ndim == 4 and conf_raw.shape[-1] == 1:
+        conf_raw = conf_raw.squeeze(-1)
+    conf_raw = conf_raw.to(torch.float32).contiguous()
     conf_threshold = float(conf_threshold)
     conf_threshold_normalized = conf_threshold / 100.0 if conf_threshold > 1.0 else conf_threshold
     conf_threshold_normalized = float(np.clip(conf_threshold_normalized, 0.0, 1.0))
-    conf_mask = conf >= conf_threshold_normalized
-    conf_uint8 = torch.clamp(torch.round(conf * 255.0), 0.0, 255.0).to(torch.uint8).contiguous()
+    conf_for_points = _select_sequence_frames(conf_raw, point_frame_indices)
+    if conf_for_points is None:
+        raise RuntimeError("Confidence tensor is required for point export.")
+    conf_mask = conf_for_points >= conf_threshold_normalized
+    conf_uint8 = torch.clamp(torch.round(conf_raw * 255.0), 0.0, 255.0).to(torch.uint8).contiguous()
 
-    camera_poses = pred["camera_poses"][frame_indices].to(torch.float32).contiguous()
+    camera_poses_raw = pred["camera_poses"].to(torch.float32).contiguous()
+    camera_poses_for_points = _select_sequence_frames(camera_poses_raw, point_frame_indices)
+    if camera_poses_for_points is None:
+        raise RuntimeError("camera_poses tensor is required for export.")
     local_points = pred.get("local_points")
-    if local_points is not None:
-        local_points = local_points[frame_indices]
+    local_points_for_points = _select_sequence_frames(local_points, point_frame_indices) if local_points is not None else None
 
     if "points" in pred:
-        points = pred["points"][frame_indices].to(torch.float16).contiguous()
-    elif local_points is not None:
+        points = _select_sequence_frames(pred["points"], point_frame_indices)
+        if points is None:
+            raise RuntimeError("Expected points tensor for point export.")
+        points = points.to(torch.float16).contiguous()
+    elif local_points_for_points is not None:
         points = torch.einsum(
             "nij, nhwj -> nhwi",
-            camera_poses,
-            homogenize_points(local_points.to(torch.float32)),
+            camera_poses_for_points,
+            homogenize_points(local_points_for_points.to(torch.float32)),
         )[..., :3].to(torch.float16).contiguous()
     else:
         raise RuntimeError("Expected either points or local_points in predictions for point export.")
 
     if "depth_maps" in pred:
-        depth_maps = pred["depth_maps"][frame_indices].to(torch.float16).contiguous()
+        depth_maps_raw = pred["depth_maps"].to(torch.float16).contiguous()
     elif local_points is not None:
-        depth_maps = local_points[..., 2].to(torch.float16).contiguous()
+        depth_maps_raw = local_points[..., 2].to(torch.float16).contiguous()
     else:
         raise RuntimeError("Expected either depth_maps or local_points in predictions for depth export.")
     invalid_mask = ~conf_mask
     points[invalid_mask.unsqueeze(-1).expand_as(points)] = torch.nan
-    depth_maps[invalid_mask] = torch.nan
     target_width, target_height = _resolve_target_resolution(target_resolution, points)
 
     file_map = {
@@ -284,8 +307,8 @@ def save_result_directory(
     }
     torch.save(points, file_map["points"])
     _save_npz_tensor(file_map["conf"], "conf", conf_uint8)
-    _save_npz_tensor(file_map["camera_poses"], "camera_poses", camera_poses)
-    _save_npz_tensor(file_map["depth_maps"], "depth_maps", depth_maps)
+    _save_npz_tensor(file_map["camera_poses"], "camera_poses", camera_poses_raw)
+    _save_npz_tensor(file_map["depth_maps"], "depth_maps", depth_maps_raw)
 
     alignment_keys = [
         "chunk_sim3_scales",
@@ -305,19 +328,20 @@ def save_result_directory(
             if not torch.is_tensor(value):
                 continue
             if value.ndim > 0 and value.shape[0] == source_num_frames:
-                alignment_payload[key] = value[frame_indices]
+                alignment_payload[key] = value[point_frame_indices]
             elif value.ndim > 1 and value.shape[1] == source_num_frames:
-                alignment_payload[key] = value[:, frame_indices]
+                alignment_payload[key] = value[:, point_frame_indices]
         torch.save(alignment_payload, output_dir / "alignment.pt")
 
     save_trajectory_xz_plot(
         output_dir / "trajectory_xz.png",
-        camera_poses,
+        camera_poses_raw,
         canonical_first_frame=canonical_first_frame_for_plot,
     )
     video_name = Path(frame_dir).name if frame_dir is not None else None
     meta = {
-        "num_frames": int(camera_poses.shape[0]),
+        "num_frames": int(points.shape[0]),
+        "raw_num_frames": int(camera_poses_raw.shape[0]),
         "stride": absolute_stride,
         "video_name": video_name,
         "reference_frame": "initial_camera" if canonical_first_frame_for_plot else "result",
@@ -402,11 +426,26 @@ def load_result_for_viser(
     stored_stride = _normalize_stride_value(meta.get("stride", 1))
     indexed_image_paths = image_paths[::stored_stride]
 
+    def _sample_for_points(tensor: torch.Tensor) -> torch.Tensor:
+        point_len = int(tensors["points"].shape[0])
+        if int(tensor.shape[0]) == point_len:
+            return tensor
+        sample_indices = torch.arange(0, int(tensor.shape[0]), stored_stride, dtype=torch.long)
+        sampled = _select_sequence_frames(tensor, sample_indices)
+        if sampled is None:
+            raise RuntimeError("Could not sample tensor for visualization.")
+        return sampled
+
+    sampled_conf = _sample_for_points(tensors["conf"])
+    sampled_camera_poses = _sample_for_points(tensors["camera_poses"])
+    if sampled_conf is None or sampled_camera_poses is None:
+        raise RuntimeError("Could not align sampled confidence/camera poses for visualization.")
+
     sequence_length = min(
         len(indexed_image_paths),
         int(tensors["points"].shape[0]),
-        int(tensors["conf"].shape[0]),
-        int(tensors["camera_poses"].shape[0]),
+        int(sampled_conf.shape[0]),
+        int(sampled_camera_poses.shape[0]),
     )
     if sequence_length <= 0:
         raise RuntimeError("No frames available in the selected result directory.")
@@ -423,8 +462,8 @@ def load_result_for_viser(
     return {
         "images": images.permute(0, 2, 3, 1).numpy(),
         "points": tensors["points"][start_idx:end_idx].float().numpy(),
-        "conf": tensors["conf"][start_idx:end_idx].float().numpy(),
-        "camera_poses": tensors["camera_poses"][start_idx:end_idx].float().numpy(),
+        "conf": sampled_conf[start_idx:end_idx].float().numpy(),
+        "camera_poses": sampled_camera_poses[start_idx:end_idx].float().numpy(),
         "meta": meta,
         "use_result_frame": meta.get("reference_frame", "initial_camera") != "initial_camera",
         "frame_dir": str(frame_dir),
