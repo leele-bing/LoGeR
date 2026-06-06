@@ -7,6 +7,7 @@ import numpy as np
 import torch
 
 from data_utils import (
+    get_meta_pt_strides,
     list_image_files,
     load_result_meta,
     load_result_tensors,
@@ -272,7 +273,7 @@ def main() -> None:
             "overlap_size": int(meta.get("overlap_size", 3)),
         },
         stride=1,
-        input_frame_stride=int(meta.get("stride", 1)),
+        input_frame_stride=get_meta_pt_strides(meta, 1),
         conf_threshold=float(meta.get("conf_threshold", 0.0)),
         inference_stats=dict(meta.get("inference_stats", {})),
         canonical_first_frame_for_plot=False,

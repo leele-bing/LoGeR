@@ -203,6 +203,18 @@ def _normalize_stride_value(stride: Any) -> int:
         return 1
 
 
+def get_meta_num_frames_pts(meta: Dict[str, Any], default: int = 0) -> int:
+    return int(meta.get("num_frames_pts", meta.get("num_frames", default)))
+
+
+def get_meta_num_frames_img(meta: Dict[str, Any], default: int = 0) -> int:
+    return int(meta.get("num_frames_img", meta.get("raw_num_frames", default)))
+
+
+def get_meta_pt_strides(meta: Dict[str, Any], default: int = 1) -> int:
+    return _normalize_stride_value(meta.get("pt_strides", meta.get("stride", default)))
+
+
 def _select_sequence_frames(tensor: torch.Tensor | None, frame_indices: torch.Tensor) -> torch.Tensor | None:
     if tensor is None:
         return None
@@ -340,9 +352,9 @@ def save_result_directory(
     )
     video_name = Path(frame_dir).name if frame_dir is not None else None
     meta = {
-        "num_frames": int(points.shape[0]),
-        "raw_num_frames": int(camera_poses_raw.shape[0]),
-        "stride": absolute_stride,
+        "num_frames_pts": int(points.shape[0]),
+        "num_frames_img": int(camera_poses_raw.shape[0]),
+        "pt_strides": absolute_stride,
         "video_name": video_name,
         "reference_frame": "initial_camera" if canonical_first_frame_for_plot else "result",
         "conf_threshold": conf_threshold_normalized,
@@ -423,7 +435,7 @@ def load_result_for_viser(
     target_resolution = tuple(meta["target_resolution"])
     image_paths = list_image_files(frame_dir)
     tensors = load_result_tensors(result_dir)
-    stored_stride = _normalize_stride_value(meta.get("stride", 1))
+    stored_stride = get_meta_pt_strides(meta, 1)
     indexed_image_paths = image_paths[::stored_stride]
 
     def _sample_for_points(tensor: torch.Tensor) -> torch.Tensor:

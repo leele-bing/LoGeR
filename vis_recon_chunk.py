@@ -14,7 +14,7 @@ import viser
 import viser.transforms as vt
 
 from align_ground import apply_transform_to_points, apply_transform_to_poses, estimate_trajectory_frame
-from data_utils import load_result_for_viser, load_result_meta
+from data_utils import get_meta_num_frames_pts, load_result_for_viser, load_result_meta
 from loger.utils.viser_utils import add_origin_axes, add_scene_grid, apply_sky_segmentation, setup_camera_follow
 
 
@@ -201,7 +201,7 @@ def build_chunk_infos(result_root: Path, frame_root: Path, args: argparse.Namesp
                 name=result_dir.name,
                 result_dir=result_dir,
                 frame_dir=frame_dir,
-                num_frames=int(meta.get("num_frames", 0)),
+                num_frames=get_meta_num_frames_pts(meta, 0),
             )
         )
     return infos

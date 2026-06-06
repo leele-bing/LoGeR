@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, Tuple
 import numpy as np
 import torch
 
-from data_utils import load_result_meta, load_result_tensors
+from data_utils import get_meta_pt_strides, load_result_meta, load_result_tensors
 
 
 @dataclass(frozen=True)
@@ -125,7 +125,7 @@ def _select_pose_and_conf_for_points(
     meta: Dict[str, Any],
     point_frame_count: int,
 ) -> Tuple[torch.Tensor, torch.Tensor | None]:
-    stride = max(1, int(meta.get("stride", 1)))
+    stride = get_meta_pt_strides(meta, 1)
     camera_poses = tensors["camera_poses"]
     if camera_poses.ndim == 4 and camera_poses.shape[0] == 1:
         camera_poses = camera_poses.squeeze(0)
